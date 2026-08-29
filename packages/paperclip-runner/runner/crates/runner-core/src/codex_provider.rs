@@ -178,6 +178,7 @@ pub struct CodexProvider {
     expected_shutdown: bool,
     process_generation: u64,
     completed_turn_authority: Option<CompletedTurnAuthority>,
+    completion_reconciliation_pending: bool,
 }
 
 impl CodexProvider {
@@ -241,6 +242,7 @@ impl CodexProvider {
             expected_shutdown: false,
             process_generation,
             completed_turn_authority: None,
+            completion_reconciliation_pending: false,
         };
         let initialized = provider.request(
             "initialize",
@@ -338,6 +340,10 @@ impl CodexProvider {
         // is recovery, not new turn work. Keep the prior terminal authoritative
         // until start_turn explicitly revokes it.
         self.expected_shutdown = authoritative;
+        // Completion from durable state belongs to an earlier observation.
+        // It remains authoritative as a result, but cannot reconcile a crash
+        // from this newly supervised provider process.
+        self.completion_reconciliation_pending = false;
     }
 
     pub(crate) fn completed_turn_authority(&self) -> Option<(u64, &str)> {
@@ -360,6 +366,11 @@ impl CodexProvider {
                 "Codex turn text is empty or exceeds the 1 MiB limit",
             ));
         }
+        // Attempting replacement work is a post-terminal liveness observation.
+        // Preserve the prior durable result until a replacement turn identity
+        // is accepted, but do not let it hide a crash during this request.
+        let prior_reconciliation_pending = self.completion_reconciliation_pending;
+        self.completion_reconciliation_pending = false;
         let result = match self.request_classified(
             "turn/start",
             json!({
@@ -370,22 +381,13 @@ impl CodexProvider {
                 "input": [{"type": "text", "text": message, "text_elements": []}],
             }),
         ) {
-            Ok(result) => {
-                // A successful response proves Codex accepted the request even
-                // if the payload later fails required identity validation.
-                self.expected_shutdown = false;
-                self.completed_turn_authority = None;
-                result
-            }
-            Err(ProviderRequestError::Rejected(error)) => return Err(error),
-            Err(ProviderRequestError::Ambiguous(error)) => {
-                // EOF, timeout, or malformed protocol data can occur after the
-                // provider accepted replacement work. Fail closed instead of
-                // reconciling a later exit against a stale completed turn.
-                self.expected_shutdown = false;
-                self.completed_turn_authority = None;
+            Ok(result) => result,
+            Err(ProviderRequestError::Rejected(error)) => {
+                // A definite rejection proves no replacement work began.
+                self.completion_reconciliation_pending = prior_reconciliation_pending;
                 return Err(error);
             }
+            Err(ProviderRequestError::Ambiguous(error)) => return Err(error),
         };
         let provider_turn_id = result
             .pointer("/turn/id")
@@ -394,6 +396,10 @@ impl CodexProvider {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| LocalRunnerError::invalid("Codex turn/start omitted turn.id"))?
             .to_owned();
+        // Only a validated provider turn identity proves that replacement
+        // work exists and supersedes the prior completed result.
+        self.expected_shutdown = false;
+        self.completed_turn_authority = None;
         self.active_provider_turn_id = Some(provider_turn_id);
         Ok(result)
     }
@@ -431,6 +437,10 @@ impl CodexProvider {
     }
 
     pub fn read_thread(&mut self) -> Result<Value, LocalRunnerError> {
+        // A successful or ambiguous probe proves the provider remained live
+        // after the terminal. A later nonzero exit is therefore a new idle
+        // crash, not terminal cleanup that the old turn may reconcile.
+        self.completion_reconciliation_pending = false;
         self.request(
             "thread/read",
             json!({"threadId": self.thread_id, "includeTurns": true}),
@@ -474,8 +484,9 @@ impl CodexProvider {
                     // A terminal can reconcile a later failure from the process
                     // that emitted it, but it must not hide a crash from a
                     // separately resumed provider generation.
-                    let completion_reconciles_exit =
-                        completed_turn_authoritative && completed_turn_observed_by_process;
+                    let completion_reconciles_exit = completed_turn_authoritative
+                        && completed_turn_observed_by_process
+                        && self.completion_reconciliation_pending;
                     Ok(Some(CodexProviderEvent::Exited {
                         exit_code: exit.exit_code,
                         // A clean idle exit after a terminal is healthy. A
@@ -500,6 +511,16 @@ impl CodexProvider {
             };
             parse_provider_message(&line)?
         };
+
+        if self.completed_turn_authority.is_some()
+            && self.active_provider_turn_id.is_none()
+            && message.get("method").and_then(Value::as_str) != Some("turn/completed")
+        {
+            // Any provider output after the terminal is an idle liveness
+            // observation. Retain the completed result, but a subsequent
+            // nonzero exit is a distinct provider failure.
+            self.completion_reconciliation_pending = false;
+        }
 
         if let (Some(rpc_id), Some(method)) = (
             message.get("id").cloned(),
@@ -670,6 +691,7 @@ impl CodexProvider {
                     process_generation: self.process_generation,
                     provider_turn_id,
                 });
+                self.completion_reconciliation_pending = true;
                 // The provider terminal is authoritative once received. Clear
                 // local request ownership and attempt courtesy responses, but
                 // a provider that already closed stdin must not turn the

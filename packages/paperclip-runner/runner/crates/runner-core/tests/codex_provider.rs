@@ -364,7 +364,7 @@ fn clean_idle_provider_exit_preserves_completed_turn_success() {
 
     assert!(completion_seen);
     assert!(post_completion_output_seen);
-    assert_eq!(clean_exit, Some((true, true, true)));
+    assert_eq!(clean_exit, Some((true, true, false)));
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
 
@@ -456,7 +456,7 @@ fn clean_provider_exit_does_not_refail_a_completed_turn() {
 }
 
 #[test]
-fn completed_turn_authority_does_not_hide_a_resumed_process_failure() {
+fn post_completion_observation_does_not_hide_same_or_resumed_process_failure() {
     let directory = temporary_directory("completion-then-nonzero-exit");
     let config = provider_config(
         &directory,
@@ -498,9 +498,7 @@ fn completed_turn_authority_does_not_hide_a_resumed_process_failure() {
                 .map(|event| event.event_type),
         );
         if event_types.iter().any(|event| event == "turn.completed")
-            && event_types
-                .iter()
-                .any(|event| event == "session.reconciled")
+            && event_types.iter().any(|event| event == "session.failed")
         {
             break;
         }
@@ -508,10 +506,10 @@ fn completed_turn_authority_does_not_hide_a_resumed_process_failure() {
     }
 
     assert!(event_types.iter().any(|event| event == "turn.completed"));
-    assert!(event_types
+    assert!(event_types.iter().any(|event| event == "session.failed"));
+    assert!(!event_types
         .iter()
         .any(|event| event == "session.reconciled"));
-    assert!(!event_types.iter().any(|event| event == "session.failed"));
     assert!(!event_types.iter().any(|event| event == "turn.failed"));
     let persisted: Value = serde_json::from_slice(
         &fs::read(directory.join("codex-provider-state.json"))
@@ -554,7 +552,7 @@ fn completed_turn_authority_does_not_hide_a_resumed_process_failure() {
             .filter(|event| event.as_str() == "session.reconciled")
             .count(),
         1,
-        "only the recovery observation reconciles; the later process exit fails"
+        "neither the observed idle crash nor a resumed process crash may borrow completion authority"
     );
     let recovered_persisted: Value = serde_json::from_slice(
         &fs::read(directory.join("codex-provider-state.json"))
@@ -616,7 +614,7 @@ fn rejected_replacement_turn_start_preserves_prior_completion_authority() {
 }
 
 #[test]
-fn ambiguous_replacement_turn_start_revokes_prior_completion_authority() {
+fn ambiguous_replacement_turn_start_preserves_prior_result_without_reconciling_exit() {
     for (label, switch) in [
         (
             "accepted-before-response",
@@ -666,8 +664,8 @@ fn ambiguous_replacement_turn_start_revokes_prior_completion_authority() {
         });
         assert_eq!(
             ambiguous_start_exit,
-            Some((false, false, false)),
-            "{label} must not retain old completion authority"
+            Some((false, true, false)),
+            "{label} must retain the old result without hiding the provider failure"
         );
 
         fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
@@ -675,7 +673,7 @@ fn ambiguous_replacement_turn_start_revokes_prior_completion_authority() {
 }
 
 #[test]
-fn ambiguous_replacement_start_revokes_durable_authority_before_exit() {
+fn ambiguous_replacement_start_preserves_durable_authority_before_exit() {
     let directory = temporary_directory("durable-ambiguous-turn-start");
     let config = provider_config(
         &directory,
@@ -729,9 +727,12 @@ fn ambiguous_replacement_start_revokes_durable_authority_before_exit() {
             .expect("read provider state after ambiguous start"),
     )
     .expect("parse provider state after ambiguous start");
-    assert_eq!(persisted_after_start["completedTurnAuthoritative"], false);
-    assert!(persisted_after_start["completedTurnProcessGeneration"].is_null());
-    assert!(persisted_after_start["completedProviderTurnId"].is_null());
+    assert_eq!(persisted_after_start["completedTurnAuthoritative"], true);
+    assert_eq!(persisted_after_start["completedTurnProcessGeneration"], 1);
+    assert_eq!(
+        persisted_after_start["completedProviderTurnId"],
+        "provider-turn-1"
+    );
 
     let mut exit_events = Vec::new();
     for _ in 0..64 {
