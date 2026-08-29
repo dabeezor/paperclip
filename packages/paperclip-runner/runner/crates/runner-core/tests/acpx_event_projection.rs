@@ -194,9 +194,14 @@ fn rejects_invalid_durable_projection_identity() {
         .to_string()
         .contains("run identity"));
 
-    for field in ["run", "normalized session", "turn", "item"] {
+    for (field, max_chars) in [
+        ("run", 160),
+        ("normalized session", 160),
+        ("turn", 240),
+        ("item", 240),
+    ] {
         let mut invalid = context();
-        let oversized = "x".repeat(161);
+        let oversized = "x".repeat(max_chars + 1);
         match field {
             "run" => invalid.run_id = oversized,
             "normalized session" => invalid.normalized_session_id = oversized,
@@ -224,4 +229,71 @@ fn rejects_invalid_durable_projection_identity() {
             .to_string();
         assert!(error.contains("request identity"), "{error}");
     }
+}
+
+#[test]
+fn runtime_request_projection_respects_its_narrow_identity_schema() {
+    let canonical_request_schema: Value = serde_json::from_str(include_str!(
+        "../../../../protocol/schemas/request.schema.json"
+    ))
+    .unwrap();
+    let mut runtime_request_schema = canonical_request_schema["oneOf"][0].clone();
+    // This test owns identity projection. The question-set validator has its
+    // own coverage, so replace its remote reference with an unconstrained
+    // local schema before compiling the canonical runtime-request branch.
+    runtime_request_schema["properties"]["input"] = json!({});
+    let request_validator = jsonschema::validator_for(&runtime_request_schema).unwrap();
+    let request_event = AcpxProviderStateEvent::InputRequest {
+        request_id: "request-1".to_owned(),
+        question_set: json!({
+            "schema":"paperclip.question_set.v1",
+            "questions":[],
+        }),
+        origin: None,
+    };
+    let valid = project_acpx_state_event(&context(), &request_event).unwrap();
+    assert!(request_validator.is_valid(&valid[0].payload["request"]));
+
+    for (label, field) in [("turn", "turnId"), ("item", "itemId")] {
+        let mut oversized_context = context();
+        let oversized = "x".repeat(161);
+        if label == "turn" {
+            oversized_context.turn_id = oversized.clone();
+        } else {
+            oversized_context.item_id = oversized.clone();
+        }
+        let error = project_acpx_state_event(&oversized_context, &request_event)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!("runtime request {label} identity")));
+
+        let mut invalid_request = valid[0].payload["request"].clone();
+        invalid_request[field] = Value::String(oversized);
+        assert!(!request_validator.is_valid(&invalid_request));
+    }
+
+    let mut durable_context = context();
+    durable_context.turn_id = "t".repeat(240);
+    durable_context.item_id = "i".repeat(240);
+    let diagnostic = AcpxProviderStateEvent::Diagnostic {
+        code: "notice".to_owned(),
+        message: "message".to_owned(),
+    };
+    assert!(project_acpx_state_event(&durable_context, &diagnostic).is_ok());
+
+    let semantic = project_acpx_state_event(
+        &durable_context,
+        &AcpxProviderStateEvent::ToolCall {
+            call_id: "call-1".to_owned(),
+            operation_id: "issues.read".to_owned(),
+            input: json!({"taskId":"task-1"}),
+        },
+    )
+    .unwrap();
+    let semantic_schema: Value = serde_json::from_str(include_str!(
+        "../../../../protocol/schemas/semantic-tool.schema.json"
+    ))
+    .unwrap();
+    let semantic_validator = jsonschema::validator_for(&semantic_schema).unwrap();
+    assert!(semantic_validator.is_valid(&semantic[0].payload["semantic_tool"]));
 }

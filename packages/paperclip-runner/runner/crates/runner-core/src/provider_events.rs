@@ -50,13 +50,16 @@ pub struct AcpxEventProjectionContext {
 
 impl AcpxEventProjectionContext {
     pub fn validate(&self) -> Result<(), LocalRunnerError> {
-        for (value, label) in [
-            (&self.run_id, "run"),
-            (&self.normalized_session_id, "normalized session"),
-            (&self.turn_id, "turn"),
-            (&self.item_id, "item"),
+        for (value, label, max_chars) in [
+            (&self.run_id, "run", 160),
+            (&self.normalized_session_id, "normalized session", 160),
+            // Semantic-tool correlation accepts the durable 240-character
+            // identity contract. Narrower payloads validate explicitly at
+            // their projection boundary below.
+            (&self.turn_id, "turn", 240),
+            (&self.item_id, "item", 240),
         ] {
-            validate_projection_identity(value, label)?;
+            validate_projection_identity(value, label, max_chars)?;
         }
         Ok(())
     }
@@ -149,7 +152,12 @@ pub fn project_acpx_state_event(
             question_set,
             origin,
         } => {
-            validate_projection_identity(request_id, "request")?;
+            validate_projection_identity(request_id, "request", 160)?;
+            // paperclip.runtime_request.v2 is intentionally narrower than
+            // semantic correlation: never emit a request that its canonical
+            // schema rejects, even when the durable context itself is valid.
+            validate_projection_identity(&context.turn_id, "runtime request turn", 160)?;
+            validate_projection_identity(&context.item_id, "runtime request item", 160)?;
             let prompt = question_set
                 .get("title")
                 .or_else(|| question_set.pointer("/questions/0/prompt"))
@@ -239,8 +247,14 @@ pub fn project_acpx_state_event(
     }
 }
 
-fn validate_projection_identity(value: &str, label: &str) -> Result<(), LocalRunnerError> {
-    if value.trim().is_empty() || value.chars().count() > 160 || value.chars().any(char::is_control)
+fn validate_projection_identity(
+    value: &str,
+    label: &str,
+    max_chars: usize,
+) -> Result<(), LocalRunnerError> {
+    if value.trim().is_empty()
+        || value.chars().count() > max_chars
+        || value.chars().any(char::is_control)
     {
         return Err(LocalRunnerError::invalid(format!(
             "ACPX event projection {label} identity is invalid"
