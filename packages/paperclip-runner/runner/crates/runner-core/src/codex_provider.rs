@@ -4,17 +4,20 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::durable::redact_text;
 use crate::local_runner::LocalRunnerError;
 use crate::process_supervisor::SupervisedProcess;
 use crate::provider_bridge::{AuthorizedTool, ToolResult};
+use crate::provider_events::normalized_codex_terminal_event_type;
 
 pub const CODEX_APP_SERVER_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BUFFERED_MESSAGES: usize = 1_024;
 const MAX_INSTRUCTIONS_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_TOOL_REQUESTS: usize = 4_096;
 const MAX_PENDING_TOOL_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SETTLED_PROVIDER_TURN_IDS: usize = 4_096;
 type QuestionOptionLabels = BTreeMap<String, BTreeMap<String, String>>;
 type QuestionSetMapping = (String, Value, QuestionOptionLabels);
 
@@ -134,6 +137,32 @@ struct CompletedTurnAuthority {
     provider_turn_id: String,
 }
 
+#[derive(Default)]
+struct SettledProviderTurnIds {
+    ids: BTreeSet<String>,
+    insertion_order: VecDeque<String>,
+}
+
+impl SettledProviderTurnIds {
+    fn insert(&mut self, provider_turn_id: String) {
+        if !self.ids.insert(provider_turn_id.clone()) {
+            return;
+        }
+        self.insertion_order.push_back(provider_turn_id);
+        while self.ids.len() > MAX_SETTLED_PROVIDER_TURN_IDS {
+            let oldest = self
+                .insertion_order
+                .pop_front()
+                .expect("settled provider turn order tracks every retained identity");
+            self.ids.remove(&oldest);
+        }
+    }
+
+    fn contains(&self, provider_turn_id: &str) -> bool {
+        self.ids.contains(provider_turn_id)
+    }
+}
+
 enum ProviderRequestError {
     Rejected(LocalRunnerError),
     Ambiguous(LocalRunnerError),
@@ -158,6 +187,7 @@ struct PendingToolRequest {
 #[derive(Clone, Debug, PartialEq)]
 struct PendingRuntimeRequest {
     rpc_id: Value,
+    turn_id: String,
     method: String,
     params: Value,
     question_set: Value,
@@ -175,10 +205,13 @@ pub struct CodexProvider {
     pending_tool_requests: BTreeMap<String, PendingToolRequest>,
     pending_tool_request_bytes: usize,
     pending_runtime_requests: BTreeMap<String, PendingRuntimeRequest>,
+    runtime_request_scope: [u8; 16],
+    next_runtime_request_sequence: u64,
     expected_shutdown: bool,
     process_generation: u64,
     completed_turn_authority: Option<CompletedTurnAuthority>,
     completion_reconciliation_pending: bool,
+    settled_provider_turn_ids: SettledProviderTurnIds,
 }
 
 impl CodexProvider {
@@ -197,20 +230,7 @@ impl CodexProvider {
         Self::start_with_tools_for_generation(config, authorized_tools, resume_thread_id, 1)
     }
 
-    pub(crate) fn start_for_generation(
-        config: &CodexProviderConfig,
-        resume_thread_id: Option<&str>,
-        process_generation: u64,
-    ) -> Result<Self, LocalRunnerError> {
-        Self::start_with_tools_for_generation(
-            config,
-            std::iter::empty(),
-            resume_thread_id,
-            process_generation,
-        )
-    }
-
-    fn start_with_tools_for_generation(
+    pub(crate) fn start_with_tools_for_generation(
         config: &CodexProviderConfig,
         authorized_tools: impl IntoIterator<Item = AuthorizedTool>,
         resume_thread_id: Option<&str>,
@@ -239,10 +259,13 @@ impl CodexProvider {
             pending_tool_requests: BTreeMap::new(),
             pending_tool_request_bytes: 0,
             pending_runtime_requests: BTreeMap::new(),
+            runtime_request_scope: new_runtime_request_scope()?,
+            next_runtime_request_sequence: 1,
             expected_shutdown: false,
             process_generation,
             completed_turn_authority: None,
             completion_reconciliation_pending: false,
+            settled_provider_turn_ids: SettledProviderTurnIds::default(),
         };
         let initialized = provider.request(
             "initialize",
@@ -336,6 +359,10 @@ impl CodexProvider {
                 .unwrap_or("durable-completed-turn")
                 .to_owned(),
         });
+        if let Some(authority) = self.completed_turn_authority.as_ref() {
+            self.settled_provider_turn_ids
+                .insert(authority.provider_turn_id.clone());
+        }
         // Resuming a completed durable thread and reading its provider state
         // is recovery, not new turn work. Keep the prior terminal authoritative
         // until start_turn explicitly revokes it.
@@ -371,6 +398,7 @@ impl CodexProvider {
         // is accepted, but do not let it hide a crash during this request.
         let prior_reconciliation_pending = self.completion_reconciliation_pending;
         self.completion_reconciliation_pending = false;
+        let runtime_request_scope = new_runtime_request_scope()?;
         let result = match self.request_classified(
             "turn/start",
             json!({
@@ -400,7 +428,11 @@ impl CodexProvider {
         // work exists and supersedes the prior completed result.
         self.expected_shutdown = false;
         self.completed_turn_authority = None;
+        // Retain the prior settled identity while the next turn runs. Besides
+        // recognizing delayed prior-turn requests, this fails closed if a
+        // provider ambiguously reuses the same turn id for fresh work.
         self.active_provider_turn_id = Some(provider_turn_id);
+        self.runtime_request_scope = runtime_request_scope;
         Ok(result)
     }
 
@@ -459,11 +491,46 @@ impl CodexProvider {
             .ok_or_else(|| {
                 LocalRunnerError::invalid("runtime response has no pending Codex request")
             })?;
+        if self.active_provider_turn_id.as_deref() != Some(pending.turn_id.as_str()) {
+            return Err(LocalRunnerError::invalid(
+                "runtime response belongs to another Codex turn",
+            ));
+        }
         let result = codex_question_response(&pending, response)?;
         self.process
             .send(&json!({"id": pending.rpc_id, "result": result}))?;
         self.pending_runtime_requests.remove(request_id);
         Ok(())
+    }
+
+    fn reject_post_terminal_request(
+        &mut self,
+        rpc_id: Value,
+        method: &str,
+    ) -> Result<Option<CodexProviderEvent>, LocalRunnerError> {
+        let message = format!(
+            "ignored delayed {} request after the Codex turn terminated",
+            bounded_method(method)
+        );
+        let response = if method == "item/tool/call" {
+            json!({
+                "id": rpc_id,
+                "result": codex_tool_failure("the Codex turn has already terminated"),
+            })
+        } else {
+            json!({
+                "id": rpc_id,
+                "error": {"code": -32000, "message": "the Codex turn has already terminated"},
+            })
+        };
+        // The terminal notification is already authoritative and may be
+        // waiting in the durable outbox. A courtesy rejection must not turn a
+        // provider that has closed stdin into a fatal polling error.
+        let _ = self.process.send(&response);
+        Ok(Some(CodexProviderEvent::Notification {
+            method: "warning".to_owned(),
+            params: json!({"message": message, "providerMethod": bounded_method(method)}),
+        }))
     }
 
     pub fn poll(&mut self) -> Result<Option<CodexProviderEvent>, LocalRunnerError> {
@@ -532,6 +599,13 @@ impl CodexProvider {
                     return Err(LocalRunnerError::invalid(
                         "Codex tool call named another thread",
                     ));
+                }
+                if request_targets_non_active_turn(
+                    self.active_provider_turn_id.as_deref(),
+                    &self.settled_provider_turn_ids,
+                    &params,
+                ) {
+                    return self.reject_post_terminal_request(rpc_id, method);
                 }
                 let active_turn_id = self.active_provider_turn_id.as_deref().ok_or_else(|| {
                     LocalRunnerError::invalid("Codex tool call arrived outside an active turn")
@@ -627,36 +701,60 @@ impl CodexProvider {
                         "Codex runtime request named another thread",
                     ));
                 }
-                let active_turn_id = self.active_provider_turn_id.as_deref().ok_or_else(|| {
+                if request_targets_non_active_turn(
+                    self.active_provider_turn_id.as_deref(),
+                    &self.settled_provider_turn_ids,
+                    &params,
+                ) {
+                    return self.reject_post_terminal_request(rpc_id, method);
+                }
+                let active_turn_id = self.active_provider_turn_id.clone().ok_or_else(|| {
                     LocalRunnerError::invalid(
                         "Codex runtime request arrived outside an active turn",
                     )
                 })?;
-                if params.get("turnId").and_then(Value::as_str) != Some(active_turn_id) {
+                if params.get("turnId").and_then(Value::as_str) != Some(active_turn_id.as_str()) {
                     return Err(LocalRunnerError::invalid(
                         "Codex runtime request named another turn",
                     ));
                 }
-                let (request_id, question_set, option_labels) =
+                let (provider_request_id, question_set, option_labels) =
                     codex_question_set(&rpc_id, &params)?;
                 let pending = PendingRuntimeRequest {
-                    rpc_id,
+                    rpc_id: rpc_id.clone(),
+                    turn_id: active_turn_id.clone(),
                     method: method.to_owned(),
                     params,
                     question_set: question_set.clone(),
                     option_labels,
                 };
-                if let Some(existing) = self.pending_runtime_requests.get(&request_id) {
+                if let Some(existing) = self
+                    .pending_runtime_requests
+                    .values()
+                    .find(|existing| existing.rpc_id == rpc_id)
+                {
                     if existing != &pending {
                         return Err(LocalRunnerError::invalid(
                             "Codex reused a runtime request id with different input",
                         ));
                     }
                     return Ok(None);
-                } else {
-                    self.pending_runtime_requests
-                        .insert(request_id.clone(), pending);
                 }
+                let request_sequence = self.next_runtime_request_sequence;
+                self.next_runtime_request_sequence = self
+                    .next_runtime_request_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        LocalRunnerError::invalid("Codex runtime request sequence overflowed")
+                    })?;
+                let request_id = scoped_runtime_request_id(
+                    &self.runtime_request_scope,
+                    &active_turn_id,
+                    &provider_request_id,
+                    request_sequence,
+                );
+                self.pending_runtime_requests
+                    .insert(request_id.clone(), pending);
                 return Ok(Some(CodexProviderEvent::RuntimeRequest {
                     request_id,
                     question_set,
@@ -674,24 +772,51 @@ impl CodexProvider {
 
         if let Some(method) = message.get("method").and_then(Value::as_str) {
             let params = message.get("params").cloned().unwrap_or(Value::Null);
+            let terminal_event_type = normalized_codex_terminal_event_type(method, &params);
+            let notification_turn_id = params
+                .get("turnId")
+                .or_else(|| params.pointer("/turn/id"))
+                .and_then(Value::as_str);
+            if terminal_event_type.is_some()
+                && notification_turn_id.is_some()
+                && notification_turn_id != self.active_provider_turn_id.as_deref()
+            {
+                return Ok(Some(CodexProviderEvent::Notification {
+                    method: "warning".to_owned(),
+                    params: json!({
+                        "message": "ignored a terminal notification for a non-active Codex turn",
+                        "providerMethod": bounded_method(method),
+                    }),
+                }));
+            }
             validate_notification_binding(
                 &self.thread_id,
                 self.active_provider_turn_id.as_deref(),
                 &params,
             )?;
-            if method == "turn/completed" {
-                let provider_turn_id = self.active_provider_turn_id.clone().ok_or_else(|| {
-                    LocalRunnerError::invalid(
-                        "Codex completion arrived outside an active provider turn",
-                    )
-                })?;
+            if let Some(terminal_event_type) = terminal_event_type {
+                if self.active_provider_turn_id.is_none() {
+                    return Err(LocalRunnerError::invalid(
+                        "Codex terminal arrived outside an active provider turn",
+                    ));
+                }
+                let provider_turn_id = self
+                    .active_provider_turn_id
+                    .clone()
+                    .expect("active provider turn checked above");
+                let completed_turn_authority = if terminal_event_type == "turn.completed" {
+                    Some(CompletedTurnAuthority {
+                        process_generation: self.process_generation,
+                        provider_turn_id: provider_turn_id.clone(),
+                    })
+                } else {
+                    None
+                };
                 self.active_provider_turn_id = None;
                 self.expected_shutdown = true;
-                self.completed_turn_authority = Some(CompletedTurnAuthority {
-                    process_generation: self.process_generation,
-                    provider_turn_id,
-                });
-                self.completion_reconciliation_pending = true;
+                self.completed_turn_authority = completed_turn_authority;
+                self.completion_reconciliation_pending = terminal_event_type == "turn.completed";
+                self.settled_provider_turn_ids.insert(provider_turn_id);
                 // The provider terminal is authoritative once received. Clear
                 // local request ownership and attempt courtesy responses, but
                 // a provider that already closed stdin must not turn the
@@ -933,7 +1058,14 @@ fn codex_dynamic_tools(
 
 fn bounded_identifier(value: Option<&str>, label: &str) -> Result<String, LocalRunnerError> {
     let value = value.ok_or_else(|| LocalRunnerError::invalid(format!("{label} is required")))?;
-    if value.is_empty() || value.len() > 160 || value.chars().any(char::is_control) {
+    let mut characters = value.chars();
+    let valid_first = characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphanumeric());
+    let valid_rest = characters.all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+    });
+    if value.len() > 160 || !valid_first || !valid_rest {
         return Err(LocalRunnerError::invalid(format!("{label} is invalid")));
     }
     Ok(value.to_owned())
@@ -986,6 +1118,17 @@ fn validate_notification_binding(
         }
     }
     Ok(())
+}
+
+fn request_targets_non_active_turn(
+    active_turn_id: Option<&str>,
+    settled_turn_ids: &SettledProviderTurnIds,
+    params: &Value,
+) -> bool {
+    let requested_turn_id = params.get("turnId").and_then(Value::as_str);
+    requested_turn_id.is_some_and(|requested| {
+        settled_turn_ids.contains(requested) || active_turn_id != Some(requested)
+    })
 }
 
 fn latest_active_turn_id(snapshot: &Value) -> Option<String> {
@@ -1122,6 +1265,33 @@ fn codex_question_set(
         }),
         option_labels,
     ))
+}
+
+fn new_runtime_request_scope() -> Result<[u8; 16], LocalRunnerError> {
+    let mut scope = [0u8; 16];
+    getrandom::fill(&mut scope).map_err(|error| {
+        LocalRunnerError::invalid(format!(
+            "failed to mint Codex runtime request scope: {error}"
+        ))
+    })?;
+    Ok(scope)
+}
+
+fn scoped_runtime_request_id(
+    scope: &[u8; 16],
+    turn_id: &str,
+    provider_request_id: &str,
+    request_sequence: u64,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(scope);
+    digest.update([0]);
+    digest.update(turn_id.as_bytes());
+    digest.update([0]);
+    digest.update(provider_request_id.as_bytes());
+    digest.update([0]);
+    digest.update(request_sequence.to_be_bytes());
+    format!("runtime-request-{:x}", digest.finalize())
 }
 
 fn codex_question_response(
@@ -1264,6 +1434,7 @@ mod tests {
         assert_eq!(question_set["schema"], "paperclip.question_set.v1");
         let pending = PendingRuntimeRequest {
             rpc_id: json!(41),
+            turn_id: "turn-1".to_owned(),
             method: "item/tool/requestUserInput".to_owned(),
             params: Value::Null,
             question_set,
@@ -1289,6 +1460,23 @@ mod tests {
             }),
         )
         .is_err());
+        let scope = [7u8; 16];
+        assert_eq!(
+            scoped_runtime_request_id(&scope, "turn-1", "41", 1),
+            scoped_runtime_request_id(&scope, "turn-1", "41", 1),
+        );
+        assert_ne!(
+            scoped_runtime_request_id(&scope, "turn-1", "41", 1),
+            scoped_runtime_request_id(&scope, "turn-2", "41", 1),
+        );
+        assert_ne!(
+            scoped_runtime_request_id(&scope, "turn-1", "41", 1),
+            scoped_runtime_request_id(&[8u8; 16], "turn-1", "41", 1),
+        );
+        assert_ne!(
+            scoped_runtime_request_id(&scope, "turn-1", "41", 1),
+            scoped_runtime_request_id(&scope, "turn-1", "41", 2),
+        );
         assert!(codex_question_response(
             &pending,
             &json!({
@@ -1329,6 +1517,63 @@ mod tests {
             &json!({"threadId": "thread-1", "turnId": "turn-1"}),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn rejects_requests_bound_to_any_non_active_turn_nonfatally() {
+        let mut turn_one_settled = SettledProviderTurnIds::default();
+        turn_one_settled.insert("turn-1".to_owned());
+        let mut turn_two_settled = SettledProviderTurnIds::default();
+        turn_two_settled.insert("turn-2".to_owned());
+        let no_settled_turns = SettledProviderTurnIds::default();
+        assert!(request_targets_non_active_turn(
+            Some("turn-2"),
+            &turn_one_settled,
+            &json!({"turnId": "turn-1"}),
+        ));
+        assert!(request_targets_non_active_turn(
+            Some("turn-2"),
+            &turn_one_settled,
+            &json!({"turnId": "turn-0"}),
+        ));
+        assert!(request_targets_non_active_turn(
+            None,
+            &turn_two_settled,
+            &json!({"turnId": "turn-1"}),
+        ));
+        assert!(request_targets_non_active_turn(
+            Some("turn-1"),
+            &turn_one_settled,
+            &json!({"turnId": "turn-1"}),
+        ));
+        assert!(!request_targets_non_active_turn(
+            Some("turn-2"),
+            &turn_one_settled,
+            &json!({"turnId": "turn-2"}),
+        ));
+        assert!(!request_targets_non_active_turn(
+            None,
+            &no_settled_turns,
+            &json!({}),
+        ));
+    }
+
+    #[test]
+    fn settled_provider_turn_history_rolls_forward_without_exhausting_the_session() {
+        let mut settled = SettledProviderTurnIds::default();
+        for index in 0..=MAX_SETTLED_PROVIDER_TURN_IDS {
+            settled.insert(format!("turn-{index}"));
+        }
+
+        assert_eq!(settled.ids.len(), MAX_SETTLED_PROVIDER_TURN_IDS);
+        assert_eq!(settled.insertion_order.len(), MAX_SETTLED_PROVIDER_TURN_IDS);
+        assert!(!settled.contains("turn-0"));
+        assert!(settled.contains("turn-1"));
+        assert!(settled.contains(&format!("turn-{MAX_SETTLED_PROVIDER_TURN_IDS}")));
+
+        settled.insert(format!("turn-{MAX_SETTLED_PROVIDER_TURN_IDS}"));
+        assert_eq!(settled.ids.len(), MAX_SETTLED_PROVIDER_TURN_IDS);
+        assert_eq!(settled.insertion_order.len(), MAX_SETTLED_PROVIDER_TURN_IDS);
     }
 
     #[test]

@@ -94,6 +94,30 @@ fn finish_turn(state_path: &Path, state: &mut FakeState, status: &str) -> io::Re
     save_state(state_path, state)
 }
 
+fn send_question(state: &FakeState) -> io::Result<()> {
+    let turn_id = state.active_turn_id.as_deref().unwrap_or("provider-turn-1");
+    send(json!({
+        "id": "runtime-request-1",
+        "method": "item/tool/requestUserInput",
+        "params": {
+            "threadId": state.thread_id,
+            "turnId": turn_id,
+            "itemId": "question-item-1",
+            "isBlocking": true,
+            "title": "Deployment input",
+            "questions": [{
+                "id": "environment",
+                "header": "Environment",
+                "question": "Where should we deploy?",
+                "options": [
+                    {"label": "Staging", "description": "Deploy safely."},
+                    {"label": "Production", "description": "Deploy directly."}
+                ]
+            }]
+        }
+    }))
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let state_path =
@@ -107,6 +131,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let exit_after_tool_call_completion = args
         .iter()
         .any(|value| value == "--exit-after-tool-call-completion");
+    let emit_tool_call_on_resume = args
+        .iter()
+        .any(|value| value == "--emit-tool-call-on-resume");
+    let replay_completed_tool_call_count = argument(&args, "--replay-completed-tool-call-count")
+        .map(|value| value.parse::<u64>())
+        .transpose()?
+        .unwrap_or_default();
+    let finish_turn_with_pending_tool = args
+        .iter()
+        .any(|value| value == "--finish-turn-with-pending-tool");
     let require_dynamic_tool = args.iter().any(|value| value == "--require-dynamic-tool");
     let hold_turn = args.iter().any(|value| value == "--hold-turn");
     let exit_after_turn_start = args.iter().any(|value| value == "--exit-after-turn-start");
@@ -135,28 +169,69 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .any(|value| value == "--fail-after-accepting-second-turn-before-response");
     let fail_after_thread_read = args.iter().any(|value| value == "--fail-after-thread-read");
+    let fail_first_interrupt = args.iter().any(|value| value == "--fail-first-interrupt");
+    let accept_interrupt_without_terminal_once = args
+        .iter()
+        .any(|value| value == "--accept-interrupt-without-terminal-once");
+    let accept_interrupt_without_terminal = args
+        .iter()
+        .any(|value| value == "--accept-interrupt-without-terminal");
+    let interrupt_terminal_delay_ms = argument(&args, "--interrupt-terminal-delay-ms")
+        .map(|value| value.parse::<u64>())
+        .transpose()?;
     let exit_after_thread_read = args.iter().any(|value| value == "--exit-after-thread-read");
     let fail_after_turn_completion_delay_ms =
         argument(&args, "--fail-after-turn-completion-delay-ms")
             .map(|value| value.parse::<u64>())
             .transpose()?;
+    let delayed_tool_after_failed_turn = args
+        .iter()
+        .any(|value| value == "--delayed-tool-after-failed-turn");
+    let delayed_tool_after_next_turn_start = args
+        .iter()
+        .any(|value| value == "--delayed-tool-after-next-turn-start");
+    let delayed_tool_after_third_turn_start = args
+        .iter()
+        .any(|value| value == "--delayed-tool-after-third-turn-start");
+    let delayed_tool_after_second_turn_completion = args
+        .iter()
+        .any(|value| value == "--delayed-tool-after-second-turn-completion");
+    let tool_after_reused_turn_start = args
+        .iter()
+        .any(|value| value == "--tool-after-reused-turn-start");
+    let tool_after_older_reused_turn_start = args
+        .iter()
+        .any(|value| value == "--tool-after-older-reused-turn-start");
+    let question_before_failed_turn = args
+        .iter()
+        .any(|value| value == "--question-before-failed-turn");
+    let reuse_question_id = args.iter().any(|value| value == "--reuse-question-id");
     let pre_response_notification = args
         .iter()
         .any(|value| value == "--notification-before-response");
     let mut state = load_state(&state_path);
     let mut turn_start_count = 0_u64;
+    let mut interrupt_count = 0_u64;
+    let mut delayed_interrupt_terminal_scheduled = false;
+    let mut answered_questions = 0u8;
+    let mut replayed_completed_tool_calls = 0_u64;
 
     for line in io::stdin().lock().lines() {
         let message: Value = serde_json::from_str(&line?)?;
         if message.get("method").is_none() && message.get("id") == Some(&json!("runtime-request-1"))
         {
+            if reuse_question_id && answered_questions == 0 {
+                answered_questions = 1;
+                send_question(&state)?;
+                continue;
+            }
             finish_turn(&state_path, &mut state, "completed")?;
             continue;
         }
         if message.get("method").is_none() && message.get("id") == Some(&json!("tool-request-1")) {
             if message.pointer("/result/success") == Some(&json!(false)) {
                 log_call(call_log.as_deref(), "tool-response:failure")?;
-                if state.active_turn_id.is_some() {
+                if state.active_turn_id.is_some() && !hold_turn {
                     finish_turn(&state_path, &mut state, "failed")?;
                 }
                 continue;
@@ -172,7 +247,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if result != json!({"ok": true, "task": {"id": "task-1"}}) {
                 return Err("semantic tool response changed the operation result".into());
             }
-            finish_turn(&state_path, &mut state, "completed")?;
+            log_call(call_log.as_deref(), &format!("tool-response:{text}"))?;
+            if replayed_completed_tool_calls < replay_completed_tool_call_count {
+                replayed_completed_tool_calls += 1;
+                send(json!({
+                    "id": "tool-request-1",
+                    "method": "item/tool/call",
+                    "params": {
+                        "threadId": state.thread_id,
+                        "turnId": state.active_turn_id,
+                        "callId": "semantic-call-1",
+                        "tool": "get_task_context",
+                        "arguments": {}
+                    }
+                }))?;
+            } else if !hold_turn {
+                finish_turn(&state_path, &mut state, "completed")?;
+            }
             continue;
         }
         let Some(method) = message.get("method").and_then(Value::as_str) else {
@@ -212,6 +303,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "id": id,
                     "result": {"thread": {"id": state.thread_id, "sessionId": "codex-account-session"}}
                 }))?;
+                if emit_tool_call_on_resume {
+                    if let Some(turn_id) = state.active_turn_id.as_deref() {
+                        send(json!({
+                            "id": "tool-request-1",
+                            "method": "item/tool/call",
+                            "params": {
+                                "threadId": state.thread_id,
+                                "turnId": turn_id,
+                                "callId": "semantic-call-1",
+                                "tool": "get_task_context",
+                                "arguments": {}
+                            }
+                        }))?;
+                    }
+                }
             }
             "thread/read" => {
                 let turns = state
@@ -238,7 +344,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }))?;
                     return Err("configured failure after second turn rejection".into());
                 }
-                state.active_turn_id = Some("provider-turn-1".to_owned());
+                let provider_turn_id = if tool_after_reused_turn_start
+                    || (tool_after_older_reused_turn_start && turn_start_count == 3)
+                {
+                    "provider-turn-1".to_owned()
+                } else {
+                    format!("provider-turn-{turn_start_count}")
+                };
+                state.active_turn_id = Some(provider_turn_id.clone());
                 save_state(&state_path, &state)?;
                 if fail_after_accepting_second_turn_before_response && turn_start_count == 2 {
                     return Err("configured failure after accepting second turn".into());
@@ -256,14 +369,94 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 send(json!({
                     "id": id,
-                    "result": {"turn": {"id": "provider-turn-1", "status": "inProgress"}}
+                    "result": {"turn": {"id": provider_turn_id, "status": "inProgress"}}
                 }))?;
                 send(json!({
                     "method": "turn/started",
-                    "params": {"turn": {"id": "provider-turn-1"}}
+                    "params": {"turn": {"id": provider_turn_id}}
                 }))?;
                 if fail_after_second_turn_start && turn_start_count == 2 {
                     return Err("configured failure after second turn start".into());
+                } else if question_before_failed_turn {
+                    send_question(&state)?;
+                    send(json!({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": state.thread_id,
+                            "turn": {"id": provider_turn_id, "status": "failed"}
+                        }
+                    }))?;
+                    state.active_turn_id = None;
+                    save_state(&state_path, &state)?;
+                } else if delayed_tool_after_failed_turn {
+                    send(json!({
+                        "method": "turn/failed",
+                        "params": {
+                            "threadId": state.thread_id,
+                            "turn": {"id": provider_turn_id, "status": "failed"}
+                        }
+                    }))?;
+                    state.active_turn_id = None;
+                    save_state(&state_path, &state)?;
+                    send(json!({
+                        "id": "tool-request-delayed",
+                        "method": "item/tool/call",
+                        "params": {
+                            "threadId": state.thread_id,
+                            "turnId": provider_turn_id,
+                            "callId": "semantic-call-delayed",
+                            "tool": "get_task_context",
+                            "arguments": {}
+                        }
+                    }))?;
+                } else if delayed_tool_after_next_turn_start && turn_start_count == 2 {
+                    send(json!({
+                        "id": "tool-request-delayed",
+                        "method": "item/tool/call",
+                        "params": {
+                            "threadId": state.thread_id,
+                            "turnId": "provider-turn-1",
+                            "callId": "semantic-call-delayed",
+                            "tool": "get_task_context",
+                            "arguments": {}
+                        }
+                    }))?;
+                } else if delayed_tool_after_third_turn_start && turn_start_count == 3 {
+                    send(json!({
+                        "id": "tool-request-two-turns-delayed",
+                        "method": "item/tool/call",
+                        "params": {
+                            "threadId": state.thread_id,
+                            "turnId": "provider-turn-1",
+                            "callId": "semantic-call-two-turns-delayed",
+                            "tool": "get_task_context",
+                            "arguments": {}
+                        }
+                    }))?;
+                } else if tool_after_reused_turn_start && turn_start_count == 2 {
+                    send(json!({
+                        "id": "tool-request-reused-turn",
+                        "method": "item/tool/call",
+                        "params": {
+                            "threadId": state.thread_id,
+                            "turnId": "provider-turn-1",
+                            "callId": "semantic-call-reused-turn",
+                            "tool": "get_task_context",
+                            "arguments": {}
+                        }
+                    }))?;
+                } else if tool_after_older_reused_turn_start && turn_start_count == 3 {
+                    send(json!({
+                        "id": "tool-request-older-reused-turn",
+                        "method": "item/tool/call",
+                        "params": {
+                            "threadId": state.thread_id,
+                            "turnId": "provider-turn-1",
+                            "callId": "semantic-call-older-reused-turn",
+                            "tool": "get_task_context",
+                            "arguments": {}
+                        }
+                    }))?;
                 } else if exit_after_turn_start {
                     return Ok(());
                 } else if emit_tool_call {
@@ -272,41 +465,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "method": "item/tool/call",
                         "params": {
                             "threadId": state.thread_id,
-                            "turnId": "provider-turn-1",
+                            "turnId": provider_turn_id,
                             "callId": "semantic-call-1",
                             "tool": "get_task_context",
                             "arguments": {}
                         }
                     }))?;
-                    if complete_after_tool_call {
+                    if complete_after_tool_call || finish_turn_with_pending_tool {
                         finish_turn(&state_path, &mut state, "completed")?;
                         if exit_after_tool_call_completion {
                             return Ok(());
                         }
                     }
                 } else if emit_question {
-                    send(json!({
-                        "id": "runtime-request-1",
-                        "method": "item/tool/requestUserInput",
-                        "params": {
-                            "threadId": state.thread_id,
-                            "turnId": "provider-turn-1",
-                            "itemId": "question-item-1",
-                            "isBlocking": true,
-                            "title": "Deployment input",
-                            "questions": [{
-                                "id": "environment",
-                                "header": "Environment",
-                                "question": "Where should we deploy?",
-                                "options": [
-                                    {"label": "Staging", "description": "Deploy safely."},
-                                    {"label": "Production", "description": "Deploy directly."}
-                                ]
-                            }]
-                        }
-                    }))?;
+                    send_question(&state)?;
                 } else if !hold_turn {
                     finish_turn(&state_path, &mut state, "completed")?;
+                    if delayed_tool_after_second_turn_completion && turn_start_count == 2 {
+                        send(json!({
+                            "id": "tool-request-idle-two-turns-delayed",
+                            "method": "item/tool/call",
+                            "params": {
+                                "threadId": state.thread_id,
+                                "turnId": "provider-turn-1",
+                                "callId": "semantic-call-idle-two-turns-delayed",
+                                "tool": "get_task_context",
+                                "arguments": {}
+                            }
+                        }))?;
+                    }
                     if emit_post_completion_warning {
                         send(json!({
                             "method": "warning",
@@ -334,8 +521,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "turn/steer" => send(json!({"id": id, "result": {"accepted": true}}))?,
             "turn/interrupt" => {
-                send(json!({"id": id, "result": {"accepted": true}}))?;
-                finish_turn(&state_path, &mut state, "interrupted")?;
+                interrupt_count += 1;
+                if fail_first_interrupt && interrupt_count == 1 {
+                    send(json!({
+                        "id": id,
+                        "error": {"code": -32001, "message": "configured interrupt failure"}
+                    }))?;
+                } else {
+                    send(json!({"id": id, "result": {"accepted": true}}))?;
+                    if !accept_interrupt_without_terminal
+                        && !(accept_interrupt_without_terminal_once
+                            && interrupt_count == if fail_first_interrupt { 2 } else { 1 })
+                    {
+                        if let Some(delay_ms) = interrupt_terminal_delay_ms {
+                            if !delayed_interrupt_terminal_scheduled {
+                                delayed_interrupt_terminal_scheduled = true;
+                                let delayed_state_path = state_path.clone();
+                                let mut delayed_state = state.clone();
+                                thread::spawn(move || {
+                                    thread::sleep(Duration::from_millis(delay_ms));
+                                    if let Err(error) = finish_turn(
+                                        &delayed_state_path,
+                                        &mut delayed_state,
+                                        "interrupted",
+                                    ) {
+                                        eprintln!(
+                                            "failed to emit delayed interrupt terminal: {error}"
+                                        );
+                                    }
+                                });
+                            }
+                        } else {
+                            finish_turn(&state_path, &mut state, "interrupted")?;
+                        }
+                    }
+                }
             }
             _ if id.is_some() => send(json!({
                 "id": id,
