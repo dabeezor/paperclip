@@ -494,12 +494,21 @@ describe("Codex ACPX harness driver", () => {
         if (reason.includes("scheduled quarantined cleanup recovery")) {
           scheduledAttempt += 1;
           return new Promise<void>((_resolve, reject) => {
-            setTimeout(() => reject(new Error("scheduled cleanup failed")), 2);
+            setTimeout(
+              () => reject(new Error("scheduled cleanup failed")),
+              8_000,
+            );
           });
         }
         if (reason.includes("quarantined cleanup admission recovery")) {
           admissionAttempt += 1;
-          return Promise.resolve();
+          const attempt = admissionAttempt;
+          return new Promise<void>((resolve, reject) => {
+            setTimeout(() => {
+              if (attempt < 3) reject(new Error("admission cleanup failed"));
+              else resolve();
+            }, 8_000);
+          });
         }
         return Promise.reject(new Error("unexpected cleanup reason"));
       });
@@ -510,11 +519,22 @@ describe("Codex ACPX harness driver", () => {
         normalizedSessionId: "session-1",
         workingDirectory: "/workspace",
       });
-      await vi.advanceTimersByTimeAsync(2);
+      let admissionSettled = false;
+      void admission
+        .finally(() => {
+          admissionSettled = true;
+        })
+        .catch(() => undefined);
+      // The inherited attempt plus the replacement three-attempt batch takes
+      // just over 32 seconds with this fixture. The production grace must cover
+      // that complete bounded owner chain rather than expiring at 27 seconds.
+      await vi.advanceTimersByTimeAsync(32_001);
+      expect(admissionSettled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
       const admitted = await admission;
 
       expect(scheduledAttempt).toBe(1);
-      expect(admissionAttempt).toBe(1);
+      expect(admissionAttempt).toBe(3);
       expect(fixture.openHost).toHaveBeenCalledTimes(2);
       fixture.host.close.mockResolvedValue(undefined);
       await admitted.close({ reason: "complete after scheduled owner recovery" });
@@ -699,7 +719,7 @@ describe("Codex ACPX harness driver", () => {
         workingDirectory: "/workspace",
       });
       void admission.finally(() => { admissionSettled = true; }).catch(() => undefined);
-      await vi.advanceTimersByTimeAsync(26_999);
+      await vi.advanceTimersByTimeAsync(34_999);
       expect(admissionSettled).toBe(false);
       await vi.advanceTimersByTimeAsync(2);
       await expect(admission).rejects.toThrow("exceeded the admission grace");

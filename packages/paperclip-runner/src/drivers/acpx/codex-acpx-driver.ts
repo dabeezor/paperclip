@@ -59,13 +59,16 @@ const QUARANTINED_HOST_CLOSE_RETRY_MS = 60_000;
 const MAX_QUARANTINED_HOST_ATTEMPT_RETRY_DELAY_MS = 1_000;
 // Host shutdown first bounds active-turn cancellation and then performs the
 // adapter's bounded protocol/TERM/KILL cleanup. Admission can inherit an
-// already-running three-attempt recovery, so cover every attempt and bounded
-// inter-attempt delay, plus one second of scheduling margin.
+// already-running scheduled attempt before it installs a replacement
+// three-attempt recovery. Cover that inherited owner, every admission attempt,
+// and the bounded inter-attempt delays, plus one second of scheduling margin.
 const QUARANTINED_HOST_CLOSE_ATTEMPT_BOUND_MS =
   ACPX_TURN_CANCELLATION_SHUTDOWN_BOUND_MS +
   DEFAULT_CODEX_ACPX_RUNTIME_SHUTDOWN_BOUND_MS;
+const MAX_INHERITED_QUARANTINED_HOST_CLOSE_ATTEMPTS = 1;
 const QUARANTINED_HOST_ADMISSION_GRACE_MS =
-  MAX_QUARANTINED_HOST_CLOSE_RETRIES *
+  (MAX_INHERITED_QUARANTINED_HOST_CLOSE_ATTEMPTS +
+    MAX_QUARANTINED_HOST_CLOSE_RETRIES) *
     QUARANTINED_HOST_CLOSE_ATTEMPT_BOUND_MS +
   (MAX_QUARANTINED_HOST_CLOSE_RETRIES - 1) *
     MAX_QUARANTINED_HOST_ATTEMPT_RETRY_DELAY_MS +
