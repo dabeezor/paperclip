@@ -977,12 +977,11 @@ fn codex_fails_closed_when_a_provider_reuses_a_settled_turn_id() {
         .expect("start first provider turn");
     wait_for_notification(&mut provider, "turn/completed");
 
-    provider
+    let error = provider
         .start_turn("Reuse the settled provider identity.", &config.cwd)
-        .expect("start provider turn with a reused identity");
-    let warning = wait_for_notification(&mut provider, "warning");
-    assert_eq!(warning["providerMethod"], "item/tool/call");
-    assert_eq!(provider.active_provider_turn_id(), Some("provider-turn-1"));
+        .expect_err("reject a provider turn with a reused identity");
+    assert!(error.to_string().contains("reused a settled"));
+    assert_eq!(provider.active_provider_turn_id(), None);
 
     let _ = provider.shutdown();
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
@@ -1001,12 +1000,11 @@ fn codex_fails_closed_when_a_provider_reuses_an_older_settled_turn_id() {
         wait_for_notification(&mut provider, "turn/completed");
     }
 
-    provider
+    let error = provider
         .start_turn("Reuse the older settled provider identity.", &config.cwd)
-        .expect("start provider turn with an older reused identity");
-    let warning = wait_for_notification(&mut provider, "warning");
-    assert_eq!(warning["providerMethod"], "item/tool/call");
-    assert_eq!(provider.active_provider_turn_id(), Some("provider-turn-1"));
+        .expect_err("reject a provider turn with an older reused identity");
+    assert!(error.to_string().contains("reused a settled"));
+    assert_eq!(provider.active_provider_turn_id(), None);
 
     let _ = provider.shutdown();
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");

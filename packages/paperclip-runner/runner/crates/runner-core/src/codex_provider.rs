@@ -140,22 +140,17 @@ struct CompletedTurnAuthority {
 #[derive(Default)]
 struct SettledProviderTurnIds {
     ids: BTreeSet<String>,
-    insertion_order: VecDeque<String>,
 }
 
 impl SettledProviderTurnIds {
-    fn insert(&mut self, provider_turn_id: String) {
-        if !self.ids.insert(provider_turn_id.clone()) {
-            return;
+    fn insert(&mut self, provider_turn_id: String) -> bool {
+        if self.ids.contains(&provider_turn_id) {
+            return true;
         }
-        self.insertion_order.push_back(provider_turn_id);
-        while self.ids.len() > MAX_SETTLED_PROVIDER_TURN_IDS {
-            let oldest = self
-                .insertion_order
-                .pop_front()
-                .expect("settled provider turn order tracks every retained identity");
-            self.ids.remove(&oldest);
+        if self.ids.len() >= MAX_SETTLED_PROVIDER_TURN_IDS {
+            return false;
         }
+        self.ids.insert(provider_turn_id)
     }
 
     fn contains(&self, provider_turn_id: &str) -> bool {
@@ -360,8 +355,11 @@ impl CodexProvider {
                 .to_owned(),
         });
         if let Some(authority) = self.completed_turn_authority.as_ref() {
-            self.settled_provider_turn_ids
-                .insert(authority.provider_turn_id.clone());
+            debug_assert!(
+                self.settled_provider_turn_ids
+                    .insert(authority.provider_turn_id.clone()),
+                "a fresh provider has capacity for restored completion authority"
+            );
         }
         // Resuming a completed durable thread and reading its provider state
         // is recovery, not new turn work. Keep the prior terminal authoritative
@@ -391,6 +389,11 @@ impl CodexProvider {
         if message.is_empty() || message.len() > MAX_INSTRUCTIONS_BYTES {
             return Err(LocalRunnerError::invalid(
                 "Codex turn text is empty or exceeds the 1 MiB limit",
+            ));
+        }
+        if self.settled_provider_turn_ids.ids.len() >= MAX_SETTLED_PROVIDER_TURN_IDS {
+            return Err(LocalRunnerError::invalid(
+                "Codex settled turn identity limit reached; restart the provider session before accepting more work",
             ));
         }
         // Attempting replacement work is a post-terminal liveness observation.
@@ -424,6 +427,11 @@ impl CodexProvider {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| LocalRunnerError::invalid("Codex turn/start omitted turn.id"))?
             .to_owned();
+        if self.settled_provider_turn_ids.contains(&provider_turn_id) {
+            return Err(LocalRunnerError::invalid(
+                "Codex reused a settled provider turn identity",
+            ));
+        }
         // Only a validated provider turn identity proves that replacement
         // work exists and supersedes the prior completed result.
         self.expected_shutdown = false;
@@ -816,7 +824,11 @@ impl CodexProvider {
                 self.expected_shutdown = true;
                 self.completed_turn_authority = completed_turn_authority;
                 self.completion_reconciliation_pending = terminal_event_type == "turn.completed";
-                self.settled_provider_turn_ids.insert(provider_turn_id);
+                if !self.settled_provider_turn_ids.insert(provider_turn_id) {
+                    return Err(LocalRunnerError::invalid(
+                        "Codex settled turn identity limit reached",
+                    ));
+                }
                 // The provider terminal is authoritative once received. Clear
                 // local request ownership and attempt courtesy responses, but
                 // a provider that already closed stdin must not turn the
@@ -1559,21 +1571,20 @@ mod tests {
     }
 
     #[test]
-    fn settled_provider_turn_history_rolls_forward_without_exhausting_the_session() {
+    fn settled_provider_turn_history_stays_bounded_and_never_evicts_identities() {
         let mut settled = SettledProviderTurnIds::default();
-        for index in 0..=MAX_SETTLED_PROVIDER_TURN_IDS {
-            settled.insert(format!("turn-{index}"));
+        for index in 0..MAX_SETTLED_PROVIDER_TURN_IDS {
+            assert!(settled.insert(format!("turn-{index}")));
         }
 
         assert_eq!(settled.ids.len(), MAX_SETTLED_PROVIDER_TURN_IDS);
-        assert_eq!(settled.insertion_order.len(), MAX_SETTLED_PROVIDER_TURN_IDS);
-        assert!(!settled.contains("turn-0"));
+        assert!(settled.contains("turn-0"));
         assert!(settled.contains("turn-1"));
-        assert!(settled.contains(&format!("turn-{MAX_SETTLED_PROVIDER_TURN_IDS}")));
+        assert!(!settled.insert(format!("turn-{MAX_SETTLED_PROVIDER_TURN_IDS}")));
+        assert!(!settled.contains(&format!("turn-{MAX_SETTLED_PROVIDER_TURN_IDS}")));
 
-        settled.insert(format!("turn-{MAX_SETTLED_PROVIDER_TURN_IDS}"));
+        assert!(settled.insert("turn-0".to_owned()));
         assert_eq!(settled.ids.len(), MAX_SETTLED_PROVIDER_TURN_IDS);
-        assert_eq!(settled.insertion_order.len(), MAX_SETTLED_PROVIDER_TURN_IDS);
     }
 
     #[test]
