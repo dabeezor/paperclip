@@ -83,6 +83,7 @@ describe("Codex ACPX runtime adapter", () => {
       OPENAI_API_KEY: "credential-secret",
     });
     expect(runtimeOptions?.spawnCwd).toBe("/workspace");
+    expect(runtimeOptions?.elicitationModes).toEqual(["form"]);
     expect(await port.identity()).toEqual({
       acpxRecordId: "record-1",
       backendSessionId: "backend-1",
@@ -535,12 +536,14 @@ describe("Codex ACPX runtime adapter", () => {
       createRuntime: () => runtime,
     });
     const signal = new AbortController().signal;
+    const onElicitation = vi.fn();
 
     expect(
       port.startTurn({
         text: "Complete the task.",
         requestId: "turn-1",
         signal,
+        onElicitation,
       }),
     ).toBe(turn);
     expect(runtime.startTurn).toHaveBeenCalledWith({
@@ -549,6 +552,7 @@ describe("Codex ACPX runtime adapter", () => {
       mode: "prompt",
       requestId: "turn-1",
       signal,
+      onElicitation,
     });
   });
 
