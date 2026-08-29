@@ -30,6 +30,8 @@ const MAX_PACKAGE_JSON_BYTES = 256 * 1024;
 const MAX_AGENT_COMMAND_BYTES = 16 * 1024 * 1024;
 const COMMAND_SOURCE_FD = 3;
 const COMMAND_DIRECTORY_FD = 4;
+const DEPENDENCY_ANCESTOR_FD_START = 5;
+const MAX_DEPENDENCY_ANCESTORS = 64;
 
 export type AcpxPackageJsonResolver = (packageName: string) => string;
 
@@ -59,6 +61,11 @@ interface VerifiedAcpxCommandIdentity {
 interface VerifiedAcpxDirectoryIdentity {
   device: string;
   inode: string;
+}
+
+interface VerifiedAcpxDependencyAncestor {
+  path: string;
+  identity: VerifiedAcpxDirectoryIdentity;
 }
 
 type AcpxCommandFormat = "commonjs" | "module";
@@ -108,6 +115,10 @@ export async function verifyQualifiedAcpxInstallation(
   );
   const commandDirectoryIdentity = verifiedDirectory.identity;
   await verifiedDirectory.handle.close();
+  const dependencyAncestors = await inspectDependencyAncestors(
+    commandDirectory,
+    profile.agent,
+  );
   const command = await inspectCommand(
     commandPath,
     profile.commandDigest,
@@ -157,7 +168,11 @@ export async function verifyQualifiedAcpxInstallation(
           "ACPX provider executable directory identity changed after verification",
         );
       }
+      let currentDependencyAncestors: FileHandle[] = [];
       try {
+        currentDependencyAncestors = await openDependencyAncestors(
+          dependencyAncestors,
+        );
         const current = await inspectCommand(
           commandPath,
           commandDigest,
@@ -175,9 +190,13 @@ export async function verifyQualifiedAcpxInstallation(
           commandFormat,
           current.bytes,
           currentDirectory.handle,
+          currentDependencyAncestors,
         );
       } catch (error) {
-        await currentDirectory.handle.close();
+        await Promise.all([
+          currentDirectory.handle.close(),
+          ...currentDependencyAncestors.map((handle) => handle.close()),
+        ]);
         throw error;
       }
     },
@@ -375,6 +394,48 @@ async function openVerifiedCommandDirectory(
   }
 }
 
+async function inspectDependencyAncestors(
+  commandDirectory: string,
+  agent: string,
+): Promise<VerifiedAcpxDependencyAncestor[]> {
+  const ancestors: VerifiedAcpxDependencyAncestor[] = [];
+  let ancestor = dirname(commandDirectory);
+  for (let count = 0; count < MAX_DEPENDENCY_ANCESTORS; count += 1) {
+    const verified = await openVerifiedCommandDirectory(ancestor, agent);
+    ancestors.push({ path: ancestor, identity: verified.identity });
+    await verified.handle.close();
+    const parent = dirname(ancestor);
+    if (parent === ancestor) return ancestors;
+    ancestor = parent;
+  }
+  throw new Error("ACPX provider dependency ancestry exceeds its bound");
+}
+
+async function openDependencyAncestors(
+  ancestors: readonly VerifiedAcpxDependencyAncestor[],
+): Promise<FileHandle[]> {
+  const handles: FileHandle[] = [];
+  try {
+    for (const expected of ancestors) {
+      const current = await openVerifiedCommandDirectory(
+        expected.path,
+        "provider dependency ancestor",
+      );
+      if (!sameDirectoryIdentity(current.identity, expected.identity)) {
+        await current.handle.close();
+        throw new Error(
+          "ACPX provider dependency ancestor identity changed after verification",
+        );
+      }
+      handles.push(current.handle);
+    }
+    return handles;
+  } catch (error) {
+    await Promise.all(handles.map((handle) => handle.close()));
+    throw error;
+  }
+}
+
 /** Fail closed where Node cannot atomically pin a real directory inode. */
 function verifiedDirectoryOpenFlags(
   platform: NodeJS.Platform,
@@ -418,22 +479,26 @@ function commandLease(
   format: AcpxCommandFormat,
   verifiedBytes: Buffer,
   commandDirectory: FileHandle,
+  dependencyAncestors: readonly FileHandle[],
 ): VerifiedAcpxCommandLease {
   let consumed = false;
-  let directoryReleased = false;
-  const releaseDirectory = async (): Promise<void> => {
-    if (directoryReleased) return;
-    directoryReleased = true;
-    await commandDirectory.close();
+  let directoriesReleased = false;
+  const releaseDirectories = async (): Promise<void> => {
+    if (directoriesReleased) return;
+    directoriesReleased = true;
+    await Promise.all([
+      commandDirectory.close(),
+      ...dependencyAncestors.map((handle) => handle.close()),
+    ]);
   };
-  const releaseDirectoryBestEffort = (): void => {
-    void releaseDirectory().catch(() => undefined);
+  const releaseDirectoriesBestEffort = (): void => {
+    void releaseDirectories().catch(() => undefined);
   };
   const close = async (): Promise<void> => {
     if (consumed) return;
     consumed = true;
     verifiedBytes.fill(0);
-    await releaseDirectory();
+    await releaseDirectories();
   };
   return {
     spawn(
@@ -453,21 +518,29 @@ function commandLease(
               : COMMONJS_SNAPSHOT_BOOTSTRAP,
             commandDirectoryPath,
             commandName,
+            String(dependencyAncestors.length),
             ...args,
           ],
           {
             ...options,
             env: sanitizedNodeEnvironment(options.env),
             shell: false,
-            stdio: ["pipe", "pipe", "pipe", "pipe", commandDirectory.fd],
+            stdio: [
+              "pipe",
+              "pipe",
+              "pipe",
+              "pipe",
+              commandDirectory.fd,
+              ...dependencyAncestors.map((handle) => handle.fd),
+            ],
           },
         );
       } catch (error) {
         verifiedBytes.fill(0);
-        releaseDirectoryBestEffort();
+        releaseDirectoriesBestEffort();
         throw error;
       }
-      releaseDirectoryBestEffort();
+      releaseDirectoriesBestEffort();
       const sourceInput = child.stdio[COMMAND_SOURCE_FD] as Writable | null;
       if (sourceInput === null) {
         verifiedBytes.fill(0);
@@ -506,26 +579,48 @@ function snapshotBootstrap(format: AcpxCommandFormat): string {
     'const { fileURLToPath, pathToFileURL } = require("node:url");',
     "const commandDirectory = process.argv[1];",
     "const commandName = process.argv[2];",
+    "const dependencyAncestorCount = Number.parseInt(process.argv[3], 10);",
+    `if (!Number.isSafeInteger(dependencyAncestorCount) || dependencyAncestorCount < 1 || dependencyAncestorCount > ${MAX_DEPENDENCY_ANCESTORS}) throw new Error("ACPX provider dependency ancestry is invalid");`,
     "const commandPath = resolve(commandDirectory, commandName);",
-    "process.argv.splice(1, 2, commandPath);",
+    "process.argv.splice(1, 3, commandPath);",
     `const guardSnapshotModuleLookup = ${guardSnapshotModuleLookup.toString()};`,
     `const directory = process.platform === "linux" ? "/proc/self/fd/${COMMAND_DIRECTORY_FD}" : commandDirectory;`,
     "const directoryUrl = pathToFileURL(`${directory}/`).href;",
     "const pinnedTarget = new URL(commandName, directoryUrl).href;",
+    `const dependencyDirectoryUrls = Array.from({ length: dependencyAncestorCount }, (_, index) => pathToFileURL("/proc/self/fd/" + (${DEPENDENCY_ANCESTOR_FD_START} + index) + "/").href);`,
     "const target = pathToFileURL(commandPath).href;",
+    "const dependencyAncestorByUrl = new Map([[target, 0]]);",
+    "const dependencyAncestorIndex = (url) => { const recorded = dependencyAncestorByUrl.get(url); if (recorded !== undefined) return recorded; return dependencyDirectoryUrls.findIndex((dependencyDirectoryUrl) => url?.startsWith(dependencyDirectoryUrl) === true); };",
+    "const rememberDependencyAncestor = (resolution, fallbackIndex) => { const resolvedIndex = dependencyAncestorIndex(resolution?.url); const index = resolvedIndex < 0 ? fallbackIndex : resolvedIndex; if (index >= 0 && typeof resolution?.url === \"string\") dependencyAncestorByUrl.set(resolution.url, index); return resolution; };",
     `const source = fs.readFileSync(${COMMAND_SOURCE_FD});`,
     "registerHooks({ resolve(specifier, context, nextResolve) {",
     "if (specifier === target) return { url: target, shortCircuit: true };",
     "const entryImport = context.parentURL === target;",
+    "const parentDependencyAncestorIndex = entryImport ? 0 : dependencyAncestorIndex(context.parentURL);",
     'const entryRelative = entryImport && (specifier.startsWith("./") || specifier.startsWith("../"));',
     "const pinnedSpecifier = entryRelative ? new URL(specifier, pinnedTarget) : null;",
     'const lookupSpecifier = pinnedSpecifier === null ? specifier : context.conditions?.includes("require") ? fileURLToPath(pinnedSpecifier) : pinnedSpecifier.href;',
-    "const filesystemLookup = (entryImport || context.parentURL?.startsWith(directoryUrl) === true) && !isBuiltin(specifier);",
+    "const snapshotImport = entryImport || context.parentURL?.startsWith(directoryUrl) === true || dependencyDirectoryUrls.some((dependencyDirectoryUrl) => context.parentURL?.startsWith(dependencyDirectoryUrl) === true);",
+    "const filesystemLookup = snapshotImport && !isBuiltin(specifier);",
     "const lookupContext = entryImport && pinnedSpecifier === null && !isBuiltin(specifier) ? { ...context, parentURL: pinnedTarget } : context;",
-    "return guardSnapshotModuleLookup(process.platform, filesystemLookup, () => nextResolve(lookupSpecifier, lookupContext));",
+    "return guardSnapshotModuleLookup(process.platform, filesystemLookup, () => {",
+    "try { return rememberDependencyAncestor(nextResolve(lookupSpecifier, lookupContext), parentDependencyAncestorIndex); } catch (error) {",
+    'if (!snapshotImport || pinnedSpecifier !== null || isBuiltin(specifier) || error?.code !== "ERR_MODULE_NOT_FOUND") throw error;',
+    "let dependencyError = error;",
+    "for (let dependencyIndex = Math.max(0, parentDependencyAncestorIndex); dependencyIndex < dependencyDirectoryUrls.length; dependencyIndex += 1) {",
+    "const dependencyDirectoryUrl = dependencyDirectoryUrls[dependencyIndex];",
+    'try { return rememberDependencyAncestor(nextResolve(specifier, { ...context, parentURL: new URL("package.json", dependencyDirectoryUrl).href }), dependencyIndex); } catch (candidateError) {',
+    'if (candidateError?.code !== "ERR_MODULE_NOT_FOUND") throw candidateError;',
+    "dependencyError = candidateError;",
+    "}",
+    "}",
+    "throw dependencyError;",
+    "}",
+    "});",
     "}, load(url, context, nextLoad) {",
     `if (url === target) return { format: ${JSON.stringify(format)}, source, shortCircuit: true };`,
-    "return guardSnapshotModuleLookup(process.platform, url.startsWith(directoryUrl), () => nextLoad(url, context));",
+    "const descriptorLookup = url.startsWith(directoryUrl) || dependencyDirectoryUrls.some((dependencyDirectoryUrl) => url.startsWith(dependencyDirectoryUrl));",
+    "return guardSnapshotModuleLookup(process.platform, descriptorLookup, () => nextLoad(url, context));",
     "} });",
     "import(target).catch((error) => { console.error(error); process.exitCode = 1; });",
   ].join("");
