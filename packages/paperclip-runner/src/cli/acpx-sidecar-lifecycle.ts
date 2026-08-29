@@ -85,6 +85,18 @@ export async function combineSidecarAdmissionCleanups(
   }
 }
 
+/**
+ * Keep cleanup ownership until one sequential close proves the host released.
+ * A caller retry may succeed while an older recovery is still pending; that
+ * success supersedes the stale owner without turning a retry failure into an
+ * ownership release.
+ */
+export async function firstSuccessfulSidecarHostCleanup(
+  cleanups: readonly [Promise<void>, Promise<void>],
+): Promise<void> {
+  await Promise.any(cleanups);
+}
+
 export async function closeActiveSidecarHostWithin(
   host: Pick<OpenedAcpxSidecarHost, "close">,
   reason: string,

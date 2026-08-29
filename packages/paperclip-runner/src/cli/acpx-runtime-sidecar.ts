@@ -54,6 +54,7 @@ import {
   boundedIdentity,
   closeSidecarHostForCommand,
   combineSidecarAdmissionCleanups,
+  firstSuccessfulSidecarHostCleanup,
   hasSidecarSessionOwnership,
   observeSidecarCleanupWithin,
   parseAcpxRunAttachment,
@@ -1091,10 +1092,12 @@ function retainActiveHostCleanup(
   activeHost: AcpxRuntimeHost,
   cleanup: Promise<void>,
 ): void {
-  if (activeHostCleanup) return;
+  const prior = activeHostCleanup;
   const retained = closing
     ? cleanup
-    : recoverSidecarHostCleanup(activeHost, cleanup);
+    : prior
+      ? firstSuccessfulSidecarHostCleanup([prior, cleanup])
+      : recoverSidecarHostCleanup(activeHost, cleanup);
   activeHostCleanup = retained;
   void retained
     .then(

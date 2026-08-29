@@ -9,6 +9,7 @@ import {
   closeActiveSidecarHostWithin,
   closeSidecarHostForCommand,
   combineSidecarAdmissionCleanups,
+  firstSuccessfulSidecarHostCleanup,
   hasSidecarSessionOwnership,
   observeSidecarCleanupWithin,
   parseAcpxRunAttachment,
@@ -193,6 +194,37 @@ describe("Codex ACPX runtime sidecar", () => {
       recoverSidecarHostCleanup(host, initialCleanup),
     ).rejects.toThrow("close failed");
     expect(close).toHaveBeenCalledTimes(4);
+  });
+
+  it("lets a successful command retry supersede a pending cleanup owner", async () => {
+    const pending = new Promise<void>(() => undefined);
+    const successfulRetry = Promise.resolve();
+
+    await expect(
+      firstSuccessfulSidecarHostCleanup([pending, successfulRetry]),
+    ).resolves.toBeUndefined();
+  });
+
+  it("retains the prior cleanup owner when a command retry fails", async () => {
+    let finishPrior!: () => void;
+    const prior = new Promise<void>((resolve) => {
+      finishPrior = resolve;
+    });
+    const owner = firstSuccessfulSidecarHostCleanup([
+      prior,
+      Promise.reject(new Error("retry failed")),
+    ]);
+    let settled = false;
+    void owner
+      .finally(() => {
+        settled = true;
+      })
+      .catch(() => undefined);
+
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    finishPrior();
+    await expect(owner).resolves.toBeUndefined();
   });
 
   it("bounds status verification before cleaning up the opened host", async () => {
