@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -8,10 +8,13 @@ use serde_json::{json, Value};
 use crate::durable::redact_text;
 use crate::local_runner::LocalRunnerError;
 use crate::process_supervisor::SupervisedProcess;
+use crate::provider_bridge::{AuthorizedTool, ToolResult};
 
 pub const CODEX_APP_SERVER_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BUFFERED_MESSAGES: usize = 1_024;
 const MAX_INSTRUCTIONS_BYTES: usize = 1024 * 1024;
+const MAX_PENDING_TOOL_REQUESTS: usize = 4_096;
+const MAX_PENDING_TOOL_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 type QuestionOptionLabels = BTreeMap<String, BTreeMap<String, String>>;
 type QuestionSetMapping = (String, Value, QuestionOptionLabels);
 
@@ -101,6 +104,11 @@ impl CodexProviderConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum CodexProviderEvent {
+    ToolCall {
+        call_id: String,
+        operation_id: String,
+        input: Value,
+    },
     Notification {
         method: String,
         params: Value,
@@ -112,7 +120,39 @@ pub enum CodexProviderEvent {
     Exited {
         exit_code: Option<i32>,
         success: bool,
+        completed_turn_authoritative: bool,
+        completed_turn_observed_by_process: bool,
+        completion_reconciles_exit: bool,
+        process_generation: u64,
+        completed_turn_process_generation: Option<u64>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompletedTurnAuthority {
+    process_generation: u64,
+    provider_turn_id: String,
+}
+
+enum ProviderRequestError {
+    Rejected(LocalRunnerError),
+    Ambiguous(LocalRunnerError),
+}
+
+impl ProviderRequestError {
+    fn into_inner(self) -> LocalRunnerError {
+        match self {
+            Self::Rejected(error) | Self::Ambiguous(error) => error,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PendingToolRequest {
+    rpc_id: Value,
+    operation_id: String,
+    input: Value,
+    retained_bytes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -131,8 +171,13 @@ pub struct CodexProvider {
     provider_session_id: Option<String>,
     active_provider_turn_id: Option<String>,
     pending_messages: VecDeque<Value>,
+    authorized_tool_ids: BTreeSet<String>,
+    pending_tool_requests: BTreeMap<String, PendingToolRequest>,
+    pending_tool_request_bytes: usize,
     pending_runtime_requests: BTreeMap<String, PendingRuntimeRequest>,
     expected_shutdown: bool,
+    process_generation: u64,
+    completed_turn_authority: Option<CompletedTurnAuthority>,
 }
 
 impl CodexProvider {
@@ -140,7 +185,43 @@ impl CodexProvider {
         config: &CodexProviderConfig,
         resume_thread_id: Option<&str>,
     ) -> Result<Self, LocalRunnerError> {
+        Self::start_with_tools_for_generation(config, std::iter::empty(), resume_thread_id, 1)
+    }
+
+    pub fn start_with_tools(
+        config: &CodexProviderConfig,
+        authorized_tools: impl IntoIterator<Item = AuthorizedTool>,
+        resume_thread_id: Option<&str>,
+    ) -> Result<Self, LocalRunnerError> {
+        Self::start_with_tools_for_generation(config, authorized_tools, resume_thread_id, 1)
+    }
+
+    pub(crate) fn start_for_generation(
+        config: &CodexProviderConfig,
+        resume_thread_id: Option<&str>,
+        process_generation: u64,
+    ) -> Result<Self, LocalRunnerError> {
+        Self::start_with_tools_for_generation(
+            config,
+            std::iter::empty(),
+            resume_thread_id,
+            process_generation,
+        )
+    }
+
+    fn start_with_tools_for_generation(
+        config: &CodexProviderConfig,
+        authorized_tools: impl IntoIterator<Item = AuthorizedTool>,
+        resume_thread_id: Option<&str>,
+        process_generation: u64,
+    ) -> Result<Self, LocalRunnerError> {
         config.validate()?;
+        if process_generation == 0 {
+            return Err(LocalRunnerError::invalid(
+                "Codex process generation must be positive",
+            ));
+        }
+        let (dynamic_tools, authorized_tool_ids) = codex_dynamic_tools(authorized_tools)?;
         let mut provider = Self {
             process: SupervisedProcess::spawn(
                 &config.command,
@@ -153,8 +234,13 @@ impl CodexProvider {
             provider_session_id: None,
             active_provider_turn_id: None,
             pending_messages: VecDeque::new(),
+            authorized_tool_ids,
+            pending_tool_requests: BTreeMap::new(),
+            pending_tool_request_bytes: 0,
             pending_runtime_requests: BTreeMap::new(),
             expected_shutdown: false,
+            process_generation,
+            completed_turn_authority: None,
         };
         let initialized = provider.request(
             "initialize",
@@ -179,6 +265,7 @@ impl CodexProvider {
             "permissions": "paperclip-runner-workspace-only",
             "runtimeWorkspaceRoots": [config.cwd],
             "baseInstructions": config.instructions,
+            "dynamicTools": dynamic_tools,
         });
         let params_object = params
             .as_object_mut()
@@ -187,9 +274,6 @@ impl CodexProvider {
             params_object.insert("threadId".to_owned(), json!(thread_id));
             "thread/resume"
         } else {
-            // This PR does not grant any semantic tools. A later catalog and
-            // authorization layer can project a run-scoped inventory here.
-            params_object.insert("dynamicTools".to_owned(), json!([]));
             params_object.insert("experimentalRawEvents".to_owned(), json!(false));
             "thread/start"
         };
@@ -236,6 +320,35 @@ impl CodexProvider {
         self.active_provider_turn_id.as_deref()
     }
 
+    pub(crate) fn restore_completed_turn_authority(
+        &mut self,
+        authoritative: bool,
+        process_generation: Option<u64>,
+        provider_turn_id: Option<&str>,
+    ) {
+        self.completed_turn_authority = authoritative.then(|| CompletedTurnAuthority {
+            // Legacy state did not record the generation. Generation zero is
+            // deliberately older than every supervised process generation.
+            process_generation: process_generation.unwrap_or(0),
+            provider_turn_id: provider_turn_id
+                .unwrap_or("durable-completed-turn")
+                .to_owned(),
+        });
+        // Resuming a completed durable thread and reading its provider state
+        // is recovery, not new turn work. Keep the prior terminal authoritative
+        // until start_turn explicitly revokes it.
+        self.expected_shutdown = authoritative;
+    }
+
+    pub(crate) fn completed_turn_authority(&self) -> Option<(u64, &str)> {
+        self.completed_turn_authority.as_ref().map(|authority| {
+            (
+                authority.process_generation,
+                authority.provider_turn_id.as_str(),
+            )
+        })
+    }
+
     pub fn start_turn(&mut self, message: &str, cwd: &str) -> Result<Value, LocalRunnerError> {
         if self.active_provider_turn_id.is_some() {
             return Err(LocalRunnerError::invalid(
@@ -247,7 +360,7 @@ impl CodexProvider {
                 "Codex turn text is empty or exceeds the 1 MiB limit",
             ));
         }
-        let result = self.request(
+        let result = match self.request_classified(
             "turn/start",
             json!({
                 "threadId": self.thread_id,
@@ -256,7 +369,24 @@ impl CodexProvider {
                 "runtimeWorkspaceRoots": [cwd],
                 "input": [{"type": "text", "text": message, "text_elements": []}],
             }),
-        )?;
+        ) {
+            Ok(result) => {
+                // A successful response proves Codex accepted the request even
+                // if the payload later fails required identity validation.
+                self.expected_shutdown = false;
+                self.completed_turn_authority = None;
+                result
+            }
+            Err(ProviderRequestError::Rejected(error)) => return Err(error),
+            Err(ProviderRequestError::Ambiguous(error)) => {
+                // EOF, timeout, or malformed protocol data can occur after the
+                // provider accepted replacement work. Fail closed instead of
+                // reconciling a later exit against a stale completed turn.
+                self.expected_shutdown = false;
+                self.completed_turn_authority = None;
+                return Err(error);
+            }
+        };
         let provider_turn_id = result
             .pointer("/turn/id")
             .or_else(|| result.get("turnId"))
@@ -293,7 +423,7 @@ impl CodexProvider {
             .active_provider_turn_id
             .clone()
             .ok_or_else(|| LocalRunnerError::invalid("Codex has no active provider turn"))?;
-        self.cancel_pending_runtime_requests()?;
+        self.cancel_pending_requests()?;
         self.request(
             "turn/interrupt",
             json!({"threadId": self.thread_id, "turnId": turn_id}),
@@ -331,10 +461,38 @@ impl CodexProvider {
             message
         } else {
             let Some(line) = self.process.receive_stdout_line(Duration::from_millis(1))? else {
-                return if let Some(exit) = self.process.try_wait()? {
+                let exit = self.process.try_wait()?;
+                return if let Some(exit) = exit {
+                    let completed_turn_authoritative = self.completed_turn_authority.is_some()
+                        && self.active_provider_turn_id.is_none();
+                    let completed_turn_observed_by_process = self
+                        .completed_turn_authority
+                        .as_ref()
+                        .is_some_and(|authority| {
+                            authority.process_generation == self.process_generation
+                        });
+                    // A terminal can reconcile a later failure from the process
+                    // that emitted it, but it must not hide a crash from a
+                    // separately resumed provider generation.
+                    let completion_reconciles_exit =
+                        completed_turn_authoritative && completed_turn_observed_by_process;
                     Ok(Some(CodexProviderEvent::Exited {
                         exit_code: exit.exit_code,
-                        success: exit.success && self.expected_shutdown,
+                        // A clean idle exit after a terminal is healthy. A
+                        // nonzero exit still makes the provider unavailable,
+                        // but the durable terminal reconciles it instead of
+                        // allowing the session to fail retroactively. Fresh
+                        // turn work explicitly revokes the prior authority.
+                        success: exit.success
+                            && (self.expected_shutdown || completed_turn_authoritative),
+                        completed_turn_authoritative,
+                        completed_turn_observed_by_process,
+                        completion_reconciles_exit,
+                        process_generation: self.process_generation,
+                        completed_turn_process_generation: self
+                            .completed_turn_authority
+                            .as_ref()
+                            .map(|authority| authority.process_generation),
                     }))
                 } else {
                     Ok(None)
@@ -347,6 +505,100 @@ impl CodexProvider {
             message.get("id").cloned(),
             message.get("method").and_then(Value::as_str),
         ) {
+            if method == "item/tool/call" {
+                let params = message.get("params").cloned().unwrap_or(Value::Null);
+                if params.get("threadId").and_then(Value::as_str) != Some(self.thread_id.as_str()) {
+                    return Err(LocalRunnerError::invalid(
+                        "Codex tool call named another thread",
+                    ));
+                }
+                let active_turn_id = self.active_provider_turn_id.as_deref().ok_or_else(|| {
+                    LocalRunnerError::invalid("Codex tool call arrived outside an active turn")
+                })?;
+                if params.get("turnId").and_then(Value::as_str) != Some(active_turn_id) {
+                    return Err(LocalRunnerError::invalid(
+                        "Codex tool call named another turn",
+                    ));
+                }
+                let call_id = bounded_identifier(
+                    params.get("callId").and_then(Value::as_str),
+                    "Codex tool callId",
+                )?;
+                let operation_id = bounded_identifier(
+                    params.get("tool").and_then(Value::as_str),
+                    "Codex tool name",
+                )?;
+                if !self.authorized_tool_ids.contains(&operation_id) {
+                    self.process.send(&json!({
+                        "id": rpc_id,
+                        "result": codex_tool_failure("Paperclip did not authorize this tool for the run"),
+                    }))?;
+                    return Err(LocalRunnerError::invalid(format!(
+                        "Codex requested unauthorized tool {}",
+                        bounded_method(&operation_id)
+                    )));
+                }
+                let input = params.get("arguments").cloned().unwrap_or(Value::Null);
+                let input_bytes = serde_json::to_vec(&input)
+                    .map_err(|error| {
+                        LocalRunnerError::invalid(format!(
+                            "Codex tool arguments are not serializable: {error}"
+                        ))
+                    })?
+                    .len();
+                let rpc_id_bytes = serde_json::to_vec(&rpc_id)
+                    .map_err(|error| {
+                        LocalRunnerError::invalid(format!(
+                            "Codex JSON-RPC id is not serializable: {error}"
+                        ))
+                    })?
+                    .len();
+                let retained_bytes = pending_tool_request_size([
+                    input_bytes,
+                    rpc_id_bytes,
+                    call_id.len(),
+                    operation_id.len(),
+                ])?;
+                let pending = PendingToolRequest {
+                    rpc_id: rpc_id.clone(),
+                    operation_id: operation_id.clone(),
+                    input: input.clone(),
+                    retained_bytes,
+                };
+                if let Some(existing) = self.pending_tool_requests.get(&call_id) {
+                    if existing != &pending {
+                        return Err(LocalRunnerError::invalid(
+                            "Codex reused a tool call id with different input",
+                        ));
+                    }
+                    return Ok(None);
+                }
+                if self
+                    .pending_tool_requests
+                    .values()
+                    .any(|existing| existing.rpc_id == rpc_id)
+                {
+                    return Err(LocalRunnerError::invalid(
+                        "Codex reused a pending JSON-RPC id for another tool call",
+                    ));
+                }
+                if self.pending_tool_requests.len() >= MAX_PENDING_TOOL_REQUESTS {
+                    return Err(LocalRunnerError::invalid(
+                        "Codex emitted too many pending tool calls",
+                    ));
+                }
+                let retained_request_bytes = retain_pending_tool_request_bytes(
+                    self.pending_tool_request_bytes,
+                    retained_bytes,
+                )?;
+                self.pending_tool_requests.insert(call_id.clone(), pending);
+                self.pending_tool_request_bytes = retained_request_bytes;
+                return Ok(Some(CodexProviderEvent::ToolCall {
+                    call_id,
+                    operation_id,
+                    input,
+                }));
+            }
             if method == "item/tool/requestUserInput" {
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
                 if params.get("threadId").and_then(Value::as_str) != Some(self.thread_id.as_str()) {
@@ -407,7 +659,22 @@ impl CodexProvider {
                 &params,
             )?;
             if method == "turn/completed" {
+                let provider_turn_id = self.active_provider_turn_id.clone().ok_or_else(|| {
+                    LocalRunnerError::invalid(
+                        "Codex completion arrived outside an active provider turn",
+                    )
+                })?;
                 self.active_provider_turn_id = None;
+                self.expected_shutdown = true;
+                self.completed_turn_authority = Some(CompletedTurnAuthority {
+                    process_generation: self.process_generation,
+                    provider_turn_id,
+                });
+                // The provider terminal is authoritative once received. Clear
+                // local request ownership and attempt courtesy responses, but
+                // a provider that already closed stdin must not turn the
+                // completed turn back into a transport failure.
+                let _ = self.cancel_pending_requests();
             }
             return Ok(Some(CodexProviderEvent::Notification {
                 method: method.to_owned(),
@@ -417,58 +684,244 @@ impl CodexProvider {
         Ok(None)
     }
 
-    pub fn shutdown(&mut self) -> Result<(), LocalRunnerError> {
-        self.expected_shutdown = true;
-        self.cancel_pending_runtime_requests()?;
-        self.process.terminate_group().map(|_| ())
-    }
-
-    fn cancel_pending_runtime_requests(&mut self) -> Result<(), LocalRunnerError> {
-        let pending = std::mem::take(&mut self.pending_runtime_requests);
-        for request in pending.into_values() {
-            self.process.send(&json!({
-                "id": request.rpc_id,
-                "result": {"answers": {}},
-            }))?;
+    pub fn deliver_tool_result(&mut self, result: &ToolResult) -> Result<(), LocalRunnerError> {
+        let pending = self
+            .pending_tool_requests
+            .get(&result.call_id)
+            .cloned()
+            .ok_or_else(|| {
+                LocalRunnerError::invalid("Codex tool result has no pending JSON-RPC request")
+            })?;
+        if pending.operation_id != result.operation_id {
+            return Err(LocalRunnerError::invalid(
+                "Codex tool result operation does not match its call",
+            ));
+        }
+        let result_bytes = serde_json::to_vec(&result.result).map_err(|error| {
+            LocalRunnerError::invalid(format!("Codex tool result is not serializable: {error}"))
+        })?;
+        if result_bytes.len() > 1024 * 1024 {
+            return Err(LocalRunnerError::invalid(
+                "Codex tool result exceeds the 1 MiB limit",
+            ));
+        }
+        let text = String::from_utf8(result_bytes)
+            .expect("serde_json always serializes JSON values as valid UTF-8");
+        self.process.send(&json!({
+            "id": pending.rpc_id,
+            "result": {
+                "success": !result.is_error,
+                "contentItems": [{"type": "inputText", "text": text}],
+            },
+        }))?;
+        if let Some(completed) = self.pending_tool_requests.remove(&result.call_id) {
+            self.pending_tool_request_bytes = self
+                .pending_tool_request_bytes
+                .saturating_sub(completed.retained_bytes);
         }
         Ok(())
     }
 
+    pub fn shutdown(&mut self) -> Result<(), LocalRunnerError> {
+        self.expected_shutdown = true;
+        self.cancel_pending_requests()?;
+        self.process.terminate_group().map(|_| ())
+    }
+
+    fn cancel_pending_requests(&mut self) -> Result<(), LocalRunnerError> {
+        let pending_runtime = std::mem::take(&mut self.pending_runtime_requests);
+        let pending = std::mem::take(&mut self.pending_tool_requests);
+        self.pending_tool_request_bytes = 0;
+        let mut first_error = None;
+        for request in pending_runtime.into_values() {
+            if let Err(error) = self.process.send(&json!({
+                "id": request.rpc_id,
+                "result": {"answers": {}},
+            })) {
+                first_error.get_or_insert(error);
+            }
+        }
+        for request in pending.into_values() {
+            if let Err(error) = self.process.send(&json!({
+                "id": request.rpc_id,
+                "result": codex_tool_failure("Paperclip stopped the active provider turn"),
+            })) {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn request(&mut self, method: &str, params: Value) -> Result<Value, LocalRunnerError> {
+        self.request_classified(method, params)
+            .map_err(ProviderRequestError::into_inner)
+    }
+
+    fn request_classified(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, ProviderRequestError> {
         let request_id = self.next_request_id;
-        self.next_request_id = self
-            .next_request_id
-            .checked_add(1)
-            .ok_or_else(|| LocalRunnerError::invalid("Codex request id exhausted"))?;
+        self.next_request_id = self.next_request_id.checked_add(1).ok_or_else(|| {
+            ProviderRequestError::Rejected(LocalRunnerError::invalid("Codex request id exhausted"))
+        })?;
         self.process
-            .send(&json!({"id": request_id, "method": method, "params": params}))?;
+            .send(&json!({"id": request_id, "method": method, "params": params}))
+            .map_err(ProviderRequestError::Ambiguous)?;
         loop {
             let line = self
                 .process
-                .receive_stdout_line(Duration::from_secs(30))?
+                .receive_stdout_line(Duration::from_secs(30))
+                .map_err(ProviderRequestError::Ambiguous)?
                 .ok_or_else(|| {
-                    LocalRunnerError::invalid(format!("Codex {method} response timed out"))
+                    ProviderRequestError::Ambiguous(LocalRunnerError::invalid(format!(
+                        "Codex {method} response timed out"
+                    )))
                 })?;
-            let message = parse_provider_message(&line)?;
+            let message = parse_provider_message(&line).map_err(ProviderRequestError::Ambiguous)?;
             if message.get("id").and_then(Value::as_u64) == Some(request_id)
                 && message.get("method").is_none()
             {
                 if let Some(error) = message.get("error") {
-                    return Err(LocalRunnerError::invalid(format!(
-                        "Codex {method} failed: {}",
-                        redact_text(&error.to_string())
+                    let well_formed_rejection = error.get("code").and_then(Value::as_i64).is_some()
+                        && error.get("message").and_then(Value::as_str).is_some();
+                    if !well_formed_rejection || message.get("result").is_some() {
+                        return Err(ProviderRequestError::Ambiguous(LocalRunnerError::invalid(
+                            format!("Codex {method} returned an invalid error response"),
+                        )));
+                    }
+                    return Err(ProviderRequestError::Rejected(LocalRunnerError::invalid(
+                        format!("Codex {method} failed: {}", redact_text(&error.to_string())),
                     )));
                 }
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
             }
             if self.pending_messages.len() >= MAX_BUFFERED_MESSAGES {
-                return Err(LocalRunnerError::invalid(
+                return Err(ProviderRequestError::Ambiguous(LocalRunnerError::invalid(
                     "Codex emitted too many messages before a request response",
-                ));
+                )));
             }
             self.pending_messages.push_back(message);
         }
     }
+}
+
+fn pending_tool_request_size(
+    parts: impl IntoIterator<Item = usize>,
+) -> Result<usize, LocalRunnerError> {
+    parts.into_iter().try_fold(0usize, |total, part| {
+        total
+            .checked_add(part)
+            .ok_or_else(|| LocalRunnerError::invalid("Codex pending tool request size overflowed"))
+    })
+}
+
+fn retain_pending_tool_request_bytes(
+    current: usize,
+    incoming: usize,
+) -> Result<usize, LocalRunnerError> {
+    current
+        .checked_add(incoming)
+        .filter(|total| *total <= MAX_PENDING_TOOL_REQUEST_BYTES)
+        .ok_or_else(|| {
+            LocalRunnerError::invalid(
+                "Codex pending tool requests exceed the 16 MiB aggregate limit",
+            )
+        })
+}
+
+fn codex_dynamic_tools(
+    authorized_tools: impl IntoIterator<Item = AuthorizedTool>,
+) -> Result<(Vec<Value>, BTreeSet<String>), LocalRunnerError> {
+    let mut dynamic_tools = Vec::new();
+    let mut operation_ids = BTreeSet::new();
+    for tool in authorized_tools {
+        if dynamic_tools.len() >= 256 {
+            return Err(LocalRunnerError::invalid(
+                "Codex authorized tool set exceeds the operation limit",
+            ));
+        }
+        let operation_id = bounded_identifier(Some(&tool.operation_id), "Codex tool name")?;
+        let mut characters = operation_id.chars();
+        let valid_first = characters
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric());
+        let valid_rest = characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+        });
+        if !valid_first || !valid_rest {
+            return Err(LocalRunnerError::invalid(
+                "Codex tool name is not a valid operation id",
+            ));
+        }
+        if tool.version != 1
+            || tool.description.trim().is_empty()
+            || tool.description.len() > 16 * 1024
+            || tool.description.contains('\0')
+            || !tool.input_schema.is_object()
+            || !tool.response_schema.is_object()
+        {
+            return Err(LocalRunnerError::invalid(format!(
+                "Codex tool {} has an incomplete provider contract",
+                bounded_method(&operation_id)
+            )));
+        }
+        let input_schema_bytes = serde_json::to_vec(&tool.input_schema).map_err(|error| {
+            LocalRunnerError::invalid(format!("Codex tool input schema is invalid: {error}"))
+        })?;
+        if input_schema_bytes.len() > 1024 * 1024 {
+            return Err(LocalRunnerError::invalid(
+                "Codex tool input schema exceeds the 1 MiB limit",
+            ));
+        }
+        jsonschema::validator_for(&tool.input_schema).map_err(|_| {
+            LocalRunnerError::invalid(format!(
+                "Codex tool {} has an invalid input JSON Schema",
+                bounded_method(&operation_id)
+            ))
+        })?;
+        if !operation_ids.insert(operation_id.clone()) {
+            return Err(LocalRunnerError::invalid(
+                "Codex authorized tool names must be unique",
+            ));
+        }
+        dynamic_tools.push(json!({
+            "name": operation_id,
+            "description": tool.description,
+            "inputSchema": tool.input_schema,
+        }));
+    }
+    if serde_json::to_vec(&dynamic_tools)
+        .map_err(|error| {
+            LocalRunnerError::invalid(format!("Codex dynamic tool set is invalid: {error}"))
+        })?
+        .len()
+        > 4 * 1024 * 1024
+    {
+        return Err(LocalRunnerError::invalid(
+            "Codex dynamic tool set exceeds the 4 MiB limit",
+        ));
+    }
+    Ok((dynamic_tools, operation_ids))
+}
+
+fn bounded_identifier(value: Option<&str>, label: &str) -> Result<String, LocalRunnerError> {
+    let value = value.ok_or_else(|| LocalRunnerError::invalid(format!("{label} is required")))?;
+    if value.is_empty() || value.len() > 160 || value.chars().any(char::is_control) {
+        return Err(LocalRunnerError::invalid(format!("{label} is invalid")));
+    }
+    Ok(value.to_owned())
+}
+
+fn codex_tool_failure(message: &str) -> Value {
+    json!({
+        "success": false,
+        "contentItems": [{"type": "inputText", "text": message}],
+    })
 }
 
 fn parse_provider_message(line: &str) -> Result<Value, LocalRunnerError> {
@@ -854,5 +1307,19 @@ mod tests {
             &json!({"threadId": "thread-1", "turnId": "turn-1"}),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn bounds_all_retained_pending_tool_request_data_in_aggregate() {
+        let request_bytes = pending_tool_request_size([1, 2, 3, 4]).unwrap();
+        assert_eq!(request_bytes, 10);
+        assert_eq!(
+            retain_pending_tool_request_bytes(MAX_PENDING_TOOL_REQUEST_BYTES - 10, request_bytes)
+                .unwrap(),
+            MAX_PENDING_TOOL_REQUEST_BYTES
+        );
+        assert!(retain_pending_tool_request_bytes(MAX_PENDING_TOOL_REQUEST_BYTES, 1).is_err());
+        assert!(retain_pending_tool_request_bytes(usize::MAX, 1).is_err());
+        assert!(pending_tool_request_size([usize::MAX, 1]).is_err());
     }
 }

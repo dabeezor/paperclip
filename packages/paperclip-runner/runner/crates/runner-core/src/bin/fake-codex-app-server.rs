@@ -2,6 +2,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -47,6 +49,19 @@ fn log_call(path: Option<&Path>, method: &str) -> io::Result<()> {
     writeln!(file, "{method}")
 }
 
+fn has_task_context_tool(message: &Value) -> bool {
+    message
+        .pointer("/params/dynamicTools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.get("name").and_then(Value::as_str) == Some("get_task_context")
+                    && tool.get("description").and_then(Value::as_str) == Some("Read task context.")
+                    && tool.pointer("/inputSchema/type").and_then(Value::as_str) == Some("object")
+            })
+        })
+}
+
 fn finish_turn(state_path: &Path, state: &mut FakeState, status: &str) -> io::Result<()> {
     let turn_id = state
         .active_turn_id
@@ -85,17 +100,78 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         PathBuf::from(argument(&args, "--state-file").ok_or("--state-file is required")?);
     let call_log = argument(&args, "--call-log").map(PathBuf::from);
     let emit_question = args.iter().any(|value| value == "--emit-question");
+    let emit_tool_call = args.iter().any(|value| value == "--emit-tool-call");
+    let complete_after_tool_call = args
+        .iter()
+        .any(|value| value == "--complete-after-tool-call");
+    let exit_after_tool_call_completion = args
+        .iter()
+        .any(|value| value == "--exit-after-tool-call-completion");
+    let require_dynamic_tool = args.iter().any(|value| value == "--require-dynamic-tool");
     let hold_turn = args.iter().any(|value| value == "--hold-turn");
     let exit_after_turn_start = args.iter().any(|value| value == "--exit-after-turn-start");
+    let exit_after_turn_completion = args
+        .iter()
+        .any(|value| value == "--exit-after-turn-completion");
+    let emit_post_completion_warning = args
+        .iter()
+        .any(|value| value == "--emit-post-completion-warning");
+    let fail_after_turn_completion = args
+        .iter()
+        .any(|value| value == "--fail-after-turn-completion");
+    let fail_after_second_turn_start = args
+        .iter()
+        .any(|value| value == "--fail-after-second-turn-start");
+    let reject_second_turn_start = args
+        .iter()
+        .any(|value| value == "--reject-second-turn-start");
+    let malformed_error_second_turn_start = args
+        .iter()
+        .any(|value| value == "--malformed-error-second-turn-start");
+    let missing_id_second_turn_start = args
+        .iter()
+        .any(|value| value == "--missing-id-second-turn-start");
+    let fail_after_accepting_second_turn_before_response = args
+        .iter()
+        .any(|value| value == "--fail-after-accepting-second-turn-before-response");
+    let fail_after_thread_read = args.iter().any(|value| value == "--fail-after-thread-read");
+    let exit_after_thread_read = args.iter().any(|value| value == "--exit-after-thread-read");
+    let fail_after_turn_completion_delay_ms =
+        argument(&args, "--fail-after-turn-completion-delay-ms")
+            .map(|value| value.parse::<u64>())
+            .transpose()?;
     let pre_response_notification = args
         .iter()
         .any(|value| value == "--notification-before-response");
     let mut state = load_state(&state_path);
+    let mut turn_start_count = 0_u64;
 
     for line in io::stdin().lock().lines() {
         let message: Value = serde_json::from_str(&line?)?;
         if message.get("method").is_none() && message.get("id") == Some(&json!("runtime-request-1"))
         {
+            finish_turn(&state_path, &mut state, "completed")?;
+            continue;
+        }
+        if message.get("method").is_none() && message.get("id") == Some(&json!("tool-request-1")) {
+            if message.pointer("/result/success") == Some(&json!(false)) {
+                log_call(call_log.as_deref(), "tool-response:failure")?;
+                if state.active_turn_id.is_some() {
+                    finish_turn(&state_path, &mut state, "failed")?;
+                }
+                continue;
+            }
+            if message.pointer("/result/success") != Some(&json!(true)) {
+                return Err("semantic tool response omitted success".into());
+            }
+            let text = message
+                .pointer("/result/contentItems/0/text")
+                .and_then(Value::as_str)
+                .ok_or("semantic tool response omitted content text")?;
+            let result: Value = serde_json::from_str(text)?;
+            if result != json!({"ok": true, "task": {"id": "task-1"}}) {
+                return Err("semantic tool response changed the operation result".into());
+            }
             finish_turn(&state_path, &mut state, "completed")?;
             continue;
         }
@@ -111,6 +187,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }))?,
             "initialized" => {}
             "thread/start" => {
+                if require_dynamic_tool && !has_task_context_tool(&message) {
+                    return Err("thread/start omitted the authorized dynamic tool".into());
+                }
                 state.thread_id = "codex-thread-1".to_owned();
                 state.active_turn_id = None;
                 save_state(&state_path, &state)?;
@@ -125,10 +204,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "result": {"thread": {"id": state.thread_id, "sessionId": "codex-account-session"}}
                 }))?;
             }
-            "thread/resume" => send(json!({
-                "id": id,
-                "result": {"thread": {"id": state.thread_id, "sessionId": "codex-account-session"}}
-            }))?,
+            "thread/resume" => {
+                if require_dynamic_tool && !has_task_context_tool(&message) {
+                    return Err("thread/resume omitted the authorized dynamic tool".into());
+                }
+                send(json!({
+                    "id": id,
+                    "result": {"thread": {"id": state.thread_id, "sessionId": "codex-account-session"}}
+                }))?;
+            }
             "thread/read" => {
                 let turns = state
                     .active_turn_id
@@ -139,10 +223,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "id": id,
                     "result": {"thread": {"id": state.thread_id, "turns": turns}}
                 }))?;
+                if fail_after_thread_read {
+                    return Err("configured failure after thread read".into());
+                } else if exit_after_thread_read {
+                    return Ok(());
+                }
             }
             "turn/start" => {
+                turn_start_count += 1;
+                if reject_second_turn_start && turn_start_count == 2 {
+                    send(json!({
+                        "id": id,
+                        "error": {"code": -32000, "message": "replacement turn rejected"}
+                    }))?;
+                    return Err("configured failure after second turn rejection".into());
+                }
                 state.active_turn_id = Some("provider-turn-1".to_owned());
                 save_state(&state_path, &state)?;
+                if fail_after_accepting_second_turn_before_response && turn_start_count == 2 {
+                    return Err("configured failure after accepting second turn".into());
+                }
+                if malformed_error_second_turn_start && turn_start_count == 2 {
+                    send(json!({"id": id, "error": {}}))?;
+                    return Err("configured failure after malformed turn error".into());
+                }
+                if missing_id_second_turn_start && turn_start_count == 2 {
+                    send(json!({
+                        "id": id,
+                        "result": {"turn": {"status": "inProgress"}}
+                    }))?;
+                    return Err("configured failure after missing turn identity".into());
+                }
                 send(json!({
                     "id": id,
                     "result": {"turn": {"id": "provider-turn-1", "status": "inProgress"}}
@@ -151,8 +262,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "method": "turn/started",
                     "params": {"turn": {"id": "provider-turn-1"}}
                 }))?;
-                if exit_after_turn_start {
+                if fail_after_second_turn_start && turn_start_count == 2 {
+                    return Err("configured failure after second turn start".into());
+                } else if exit_after_turn_start {
                     return Ok(());
+                } else if emit_tool_call {
+                    send(json!({
+                        "id": "tool-request-1",
+                        "method": "item/tool/call",
+                        "params": {
+                            "threadId": state.thread_id,
+                            "turnId": "provider-turn-1",
+                            "callId": "semantic-call-1",
+                            "tool": "get_task_context",
+                            "arguments": {}
+                        }
+                    }))?;
+                    if complete_after_tool_call {
+                        finish_turn(&state_path, &mut state, "completed")?;
+                        if exit_after_tool_call_completion {
+                            return Ok(());
+                        }
+                    }
                 } else if emit_question {
                     send(json!({
                         "id": "runtime-request-1",
@@ -176,6 +307,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }))?;
                 } else if !hold_turn {
                     finish_turn(&state_path, &mut state, "completed")?;
+                    if emit_post_completion_warning {
+                        send(json!({
+                            "method": "warning",
+                            "params": {"message": "provider remained live after terminal"}
+                        }))?;
+                    }
+                    if fail_after_turn_completion {
+                        if let Some(delay_ms) = fail_after_turn_completion_delay_ms {
+                            thread::sleep(Duration::from_millis(delay_ms));
+                            // Make the post-terminal liveness observation
+                            // deterministic even when parallel tests delay the
+                            // controller's next poll until after this process
+                            // exits.
+                            send(json!({
+                                "method": "warning",
+                                "params": {"message": "provider remained live after terminal"}
+                            }))?;
+                        }
+                        return Err("configured failure after turn completion".into());
+                    }
+                    if exit_after_turn_completion {
+                        return Ok(());
+                    }
                 }
             }
             "turn/steer" => send(json!({"id": id, "result": {"accepted": true}}))?,

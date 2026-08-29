@@ -7,6 +7,7 @@ use paperclip_runner_core::codex_provider::{
 };
 use paperclip_runner_core::durable::{Command, CommandExecutor, DurableRunnerError, PolledEvent};
 use paperclip_runner_core::provider_backend::CodexCommandExecutor;
+use paperclip_runner_core::provider_bridge::{AuthorizedTool, ToolResult};
 use paperclip_runner_core::provider_events::normalize_codex_notification;
 use serde_json::{json, Value};
 
@@ -48,6 +49,16 @@ fn provider_config(directory: &Path, switches: &[&str]) -> CodexProviderConfig {
         provider_session_id: None,
         instructions: "Stay inside the test workspace.".to_owned(),
         approval_policy: "never".to_owned(),
+    }
+}
+
+fn task_context_tool() -> AuthorizedTool {
+    AuthorizedTool {
+        operation_id: "get_task_context".to_owned(),
+        version: 1,
+        description: "Read task context.".to_owned(),
+        input_schema: json!({"type": "object"}),
+        response_schema: json!({"type": "object"}),
     }
 }
 
@@ -118,6 +129,695 @@ fn codex_transport_buffers_notifications_while_waiting_for_responses() {
     assert!(event_types.iter().any(|event| event == "item.completed"));
     assert!(event_types.iter().any(|event| event == "usage.reported"));
     assert!(event_types.iter().any(|event| event == "turn.completed"));
+    provider.shutdown().expect("stop provider");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn codex_dynamic_tool_round_trips_through_the_provider_boundary() {
+    let directory = temporary_directory("dynamic-tool");
+    let config = provider_config(&directory, &["--require-dynamic-tool", "--emit-tool-call"]);
+    let mut provider = CodexProvider::start_with_tools(&config, [task_context_tool()], None)
+        .expect("start Codex with an authorized tool");
+    provider
+        .start_turn("Inspect the fake task.", &config.cwd)
+        .expect("start provider turn");
+
+    let mut delivered = false;
+    let mut completed = false;
+    for _ in 0..32 {
+        match provider.poll().expect("poll semantic tool event") {
+            Some(CodexProviderEvent::ToolCall {
+                call_id,
+                operation_id,
+                input,
+            }) => {
+                assert_eq!(call_id, "semantic-call-1");
+                assert_eq!(operation_id, "get_task_context");
+                assert_eq!(input, json!({}));
+                assert!(provider
+                    .deliver_tool_result(&ToolResult {
+                        call_id: call_id.clone(),
+                        operation_id: "another_operation".to_owned(),
+                        result: json!({"ok": true}),
+                        is_error: false,
+                    })
+                    .is_err());
+                assert!(provider
+                    .deliver_tool_result(&ToolResult {
+                        call_id: call_id.clone(),
+                        operation_id: operation_id.clone(),
+                        result: json!({"value": "x".repeat(1024 * 1024)}),
+                        is_error: false,
+                    })
+                    .is_err());
+                provider
+                    .deliver_tool_result(&ToolResult {
+                        call_id,
+                        operation_id,
+                        result: json!({"ok": true, "task": {"id": "task-1"}}),
+                        is_error: false,
+                    })
+                    .expect("deliver correlated semantic result");
+                delivered = true;
+            }
+            Some(CodexProviderEvent::Notification { method, .. }) if method == "turn/completed" => {
+                completed = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(delivered, "Codex emitted its authorized tool call");
+    assert!(completed, "Codex completed after the semantic result");
+    provider.shutdown().expect("stop provider");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn codex_completion_cancels_pending_tool_request_before_releasing_capacity() {
+    let directory = temporary_directory("completed-tool-call");
+    let config = provider_config(
+        &directory,
+        &[
+            "--require-dynamic-tool",
+            "--emit-tool-call",
+            "--complete-after-tool-call",
+        ],
+    );
+    let mut provider = CodexProvider::start_with_tools(&config, [task_context_tool()], None)
+        .expect("start Codex with an authorized tool");
+    provider
+        .start_turn("Complete without waiting for the tool result.", &config.cwd)
+        .expect("start provider turn");
+
+    let first_call = (0..32)
+        .find_map(
+            |_| match provider.poll().expect("poll first provider turn") {
+                Some(CodexProviderEvent::ToolCall {
+                    call_id,
+                    operation_id,
+                    ..
+                }) => Some((call_id, operation_id)),
+                _ => None,
+            },
+        )
+        .expect("observe the first semantic tool call");
+    let completed = (0..32).any(|_| {
+        matches!(
+            provider.poll().expect("poll first completion"),
+            Some(CodexProviderEvent::Notification { method, .. })
+                if method == "turn/completed"
+        )
+    });
+    assert!(completed, "Codex completed with a tool call still pending");
+    for _ in 0..100 {
+        if call_count(&directory, "tool-response:failure") == 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(
+        call_count(&directory, "tool-response:failure"),
+        1,
+        "Paperclip explicitly resolves the provider RPC as cancelled",
+    );
+    assert!(provider
+        .deliver_tool_result(&ToolResult {
+            call_id: first_call.0,
+            operation_id: first_call.1,
+            result: json!({"ok": true}),
+            is_error: false,
+        })
+        .is_err());
+
+    provider
+        .start_turn("Reuse the released provider identities.", &config.cwd)
+        .expect("start another provider turn");
+    let second_call = (0..32).any(|_| {
+        matches!(
+            provider.poll().expect("poll second provider turn"),
+            Some(CodexProviderEvent::ToolCall { call_id, .. })
+                if call_id == "semantic-call-1"
+        )
+    });
+    assert!(second_call, "the next turn can reuse the released call id");
+
+    provider.shutdown().expect("stop provider");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn codex_completion_survives_failed_pending_request_cancellation() {
+    let directory = temporary_directory("completed-tool-call-provider-exit");
+    let config = provider_config(
+        &directory,
+        &[
+            "--require-dynamic-tool",
+            "--emit-tool-call",
+            "--complete-after-tool-call",
+            "--exit-after-tool-call-completion",
+        ],
+    );
+    let mut provider = CodexProvider::start_with_tools(&config, [task_context_tool()], None)
+        .expect("start Codex with an authorized tool");
+    provider
+        .start_turn("Complete and exit with a tool call pending.", &config.cwd)
+        .expect("start provider turn");
+
+    let call = (0..32)
+        .find_map(|_| match provider.poll().expect("poll pending tool call") {
+            Some(CodexProviderEvent::ToolCall {
+                call_id,
+                operation_id,
+                ..
+            }) => Some((call_id, operation_id)),
+            _ => None,
+        })
+        .expect("observe the pending semantic tool call");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let completed = (0..32).any(|_| {
+        matches!(
+            provider
+                .poll()
+                .expect("the received completion survives closed provider stdin"),
+            Some(CodexProviderEvent::Notification { method, .. })
+                if method == "turn/completed"
+        )
+    });
+    assert!(completed, "the terminal notification remains authoritative");
+    assert!(provider
+        .deliver_tool_result(&ToolResult {
+            call_id: call.0,
+            operation_id: call.1,
+            result: json!({"ok": true}),
+            is_error: false,
+        })
+        .is_err());
+
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn clean_idle_provider_exit_preserves_completed_turn_success() {
+    let directory = temporary_directory("completion-output-clean-provider-exit");
+    let config = provider_config(
+        &directory,
+        &[
+            "--emit-post-completion-warning",
+            "--exit-after-turn-completion",
+        ],
+    );
+    let mut provider = CodexProvider::start(&config, None).expect("start Codex provider");
+    provider
+        .start_turn("Complete, produce idle output, then exit.", &config.cwd)
+        .expect("start provider turn");
+
+    let mut completion_seen = false;
+    let mut post_completion_output_seen = false;
+    let mut clean_exit = None;
+    let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < exit_deadline {
+        match provider.poll().expect("poll completion and clean exit") {
+            Some(CodexProviderEvent::Notification { method, .. }) => {
+                completion_seen |= method == "turn/completed";
+                post_completion_output_seen |= completion_seen && method == "warning";
+            }
+            Some(CodexProviderEvent::Exited {
+                success,
+                completed_turn_authoritative,
+                completion_reconciles_exit,
+                ..
+            }) => {
+                clean_exit = Some((
+                    success,
+                    completed_turn_authoritative,
+                    completion_reconciles_exit,
+                ));
+                break;
+            }
+            Some(_) | None => {}
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    assert!(completion_seen);
+    assert!(post_completion_output_seen);
+    assert_eq!(clean_exit, Some((true, true, true)));
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn clean_provider_exit_does_not_refail_a_completed_turn() {
+    let directory = temporary_directory("completion-then-clean-exit");
+    let config = provider_config(
+        &directory,
+        &[
+            "--emit-post-completion-warning",
+            "--exit-after-turn-completion",
+            "--exit-after-thread-read",
+        ],
+    );
+    let mut executor = CodexCommandExecutor::new(&directory);
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .expect("prepare Codex provider");
+    executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open Codex session");
+    executor
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Complete before exiting cleanly."}),
+        ))
+        .expect("start provider turn");
+
+    let mut event_types = Vec::new();
+    let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < exit_deadline {
+        event_types.extend(
+            poll_and_ack(&mut executor)
+                .expect("poll completion and clean exit")
+                .into_iter()
+                .map(|event| event.event_type),
+        );
+        if event_types.iter().any(|event| event == "turn.completed")
+            && event_types
+                .iter()
+                .any(|event| event == "provider.notice.recorded")
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    // The warning is ordered after the terminal and before the clean exit, so
+    // seeing it proves the completed process entered the idle/output path that
+    // previously cleared expected shutdown authority.
+    assert!(event_types.iter().any(|event| event == "turn.completed"));
+    assert!(event_types
+        .iter()
+        .any(|event| event == "provider.notice.recorded"));
+    for _ in 0..32 {
+        event_types.extend(
+            poll_and_ack(&mut executor)
+                .expect("poll after provider exit")
+                .into_iter()
+                .map(|event| event.event_type),
+        );
+    }
+
+    assert!(!event_types.iter().any(|event| event == "session.failed"));
+    let persisted: Value = serde_json::from_slice(
+        &fs::read(directory.join("codex-provider-state.json"))
+            .expect("read provider state after clean exit"),
+    )
+    .expect("parse provider state after clean exit");
+    assert_eq!(persisted["lifecycle"], "session_open");
+    assert!(persisted["activeProviderTurnId"].is_null());
+
+    drop(executor);
+    let mut recovered = CodexCommandExecutor::new(&directory);
+    let recovered_events = poll_and_ack(&mut recovered)
+        .expect("poll clean exit from a freshly resumed completed thread");
+    assert!(!recovered_events
+        .iter()
+        .any(|event| event.event_type == "session.failed"));
+
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn completed_turn_authority_does_not_hide_a_resumed_process_failure() {
+    let directory = temporary_directory("completion-then-nonzero-exit");
+    let config = provider_config(
+        &directory,
+        &[
+            "--fail-after-turn-completion",
+            "--fail-after-turn-completion-delay-ms",
+            "250",
+            "--fail-after-thread-read",
+        ],
+    );
+    let mut executor = CodexCommandExecutor::new(&directory);
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .expect("prepare Codex provider");
+    executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open Codex session");
+    executor
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Complete before exiting with an error."}),
+        ))
+        .expect("start provider turn");
+
+    let mut event_types = Vec::new();
+    let first_exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < first_exit_deadline {
+        event_types.extend(
+            poll_and_ack(&mut executor)
+                .expect("poll completion and nonzero exit")
+                .into_iter()
+                .map(|event| event.event_type),
+        );
+        if event_types.iter().any(|event| event == "turn.completed")
+            && event_types
+                .iter()
+                .any(|event| event == "session.reconciled")
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    assert!(event_types.iter().any(|event| event == "turn.completed"));
+    assert!(event_types
+        .iter()
+        .any(|event| event == "session.reconciled"));
+    assert!(!event_types.iter().any(|event| event == "session.failed"));
+    assert!(!event_types.iter().any(|event| event == "turn.failed"));
+    let persisted: Value = serde_json::from_slice(
+        &fs::read(directory.join("codex-provider-state.json"))
+            .expect("read provider state after nonzero exit"),
+    )
+    .expect("parse provider state after nonzero exit");
+    assert_eq!(persisted["lifecycle"], "provider_exited");
+    assert_eq!(persisted["completedTurnAuthoritative"], true);
+    assert_eq!(persisted["providerProcessGeneration"], 1);
+    assert_eq!(persisted["completedTurnProcessGeneration"], 1);
+
+    // A fresh process restoring the durable completed turn is a distinct
+    // supervised generation. The recovery observation is reconciled, but a
+    // later nonzero exit from that process must still report the provider
+    // failure instead of borrowing completion authority from generation 1.
+    let mut recovered = CodexCommandExecutor::new(&directory);
+    let mut recovered_event_types = Vec::new();
+    let recovered_exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < recovered_exit_deadline {
+        recovered_event_types.extend(
+            poll_and_ack(&mut recovered)
+                .expect("poll restored provider after idle crash")
+                .into_iter()
+                .map(|event| event.event_type),
+        );
+        if recovered_event_types
+            .iter()
+            .any(|event| event == "session.failed")
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(recovered_event_types
+        .iter()
+        .any(|event| event == "session.failed"));
+    assert_eq!(
+        recovered_event_types
+            .iter()
+            .filter(|event| event.as_str() == "session.reconciled")
+            .count(),
+        1,
+        "only the recovery observation reconciles; the later process exit fails"
+    );
+    let recovered_persisted: Value = serde_json::from_slice(
+        &fs::read(directory.join("codex-provider-state.json"))
+            .expect("read provider state after resumed exit"),
+    )
+    .expect("parse provider state after resumed exit");
+    assert_eq!(recovered_persisted["lifecycle"], "provider_exited");
+    assert_eq!(recovered_persisted["providerProcessGeneration"], 2);
+    assert_eq!(recovered_persisted["completedTurnProcessGeneration"], 1);
+    assert_eq!(call_count(&directory, "thread/read"), 1);
+
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn rejected_replacement_turn_start_preserves_prior_completion_authority() {
+    let directory = temporary_directory("completion-then-rejected-turn-start");
+    let config = provider_config(&directory, &["--reject-second-turn-start"]);
+    let mut provider = CodexProvider::start(&config, None).expect("start Codex provider");
+    provider
+        .start_turn("Complete the first turn.", &config.cwd)
+        .expect("start first provider turn");
+    let first_completed = (0..32).any(|_| {
+        matches!(
+            provider.poll().expect("poll first turn"),
+            Some(CodexProviderEvent::Notification { method, .. })
+                if method == "turn/completed"
+        )
+    });
+    assert!(
+        first_completed,
+        "observe the authoritative first completion"
+    );
+
+    provider
+        .start_turn("Reject replacement work.", &config.cwd)
+        .expect_err("the replacement turn/start returns a definite rejection");
+    let rejected_start_exit = (0..64).find_map(|_| {
+        match provider
+            .poll()
+            .expect("poll exit after rejected replacement start")
+        {
+            Some(CodexProviderEvent::Exited {
+                success,
+                completed_turn_authoritative,
+                completion_reconciles_exit,
+                ..
+            }) => Some((
+                success,
+                completed_turn_authoritative,
+                completion_reconciles_exit,
+            )),
+            _ => None,
+        }
+    });
+    assert_eq!(rejected_start_exit, Some((false, true, true)));
+
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn ambiguous_replacement_turn_start_revokes_prior_completion_authority() {
+    for (label, switch) in [
+        (
+            "accepted-before-response",
+            "--fail-after-accepting-second-turn-before-response",
+        ),
+        ("malformed-error", "--malformed-error-second-turn-start"),
+        ("missing-turn-id", "--missing-id-second-turn-start"),
+    ] {
+        let directory = temporary_directory(label);
+        let config = provider_config(&directory, &[switch]);
+        let mut provider = CodexProvider::start(&config, None).expect("start Codex provider");
+        provider
+            .start_turn("Complete the first turn.", &config.cwd)
+            .expect("start first provider turn");
+        let first_completed = (0..32).any(|_| {
+            matches!(
+                provider.poll().expect("poll first turn"),
+                Some(CodexProviderEvent::Notification { method, .. })
+                    if method == "turn/completed"
+            )
+        });
+        assert!(
+            first_completed,
+            "observe the authoritative first completion for {label}"
+        );
+
+        provider
+            .start_turn("Accept replacement work before failing.", &config.cwd)
+            .expect_err("the accepted replacement turn has no valid response");
+        let ambiguous_start_exit = (0..64).find_map(|_| {
+            match provider
+                .poll()
+                .expect("poll exit after ambiguous replacement start")
+            {
+                Some(CodexProviderEvent::Exited {
+                    success,
+                    completed_turn_authoritative,
+                    completion_reconciles_exit,
+                    ..
+                }) => Some((
+                    success,
+                    completed_turn_authoritative,
+                    completion_reconciles_exit,
+                )),
+                _ => None,
+            }
+        });
+        assert_eq!(
+            ambiguous_start_exit,
+            Some((false, false, false)),
+            "{label} must not retain old completion authority"
+        );
+
+        fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+    }
+}
+
+#[test]
+fn ambiguous_replacement_start_revokes_durable_authority_before_exit() {
+    let directory = temporary_directory("durable-ambiguous-turn-start");
+    let config = provider_config(
+        &directory,
+        &["--fail-after-accepting-second-turn-before-response"],
+    );
+    let mut executor = CodexCommandExecutor::new(&directory);
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .expect("prepare Codex provider");
+    executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open Codex session");
+    executor
+        .execute(&command(
+            "first-turn",
+            3,
+            "turn.start",
+            json!({"text": "Complete the first turn."}),
+        ))
+        .expect("start first provider turn");
+
+    let mut first_events = Vec::new();
+    for _ in 0..32 {
+        first_events.extend(
+            poll_and_ack(&mut executor)
+                .expect("poll first turn")
+                .into_iter()
+                .map(|event| event.event_type),
+        );
+        if first_events.iter().any(|event| event == "turn.completed") {
+            break;
+        }
+    }
+    assert!(first_events.iter().any(|event| event == "turn.completed"));
+
+    executor
+        .execute(&command(
+            "ambiguous-turn",
+            4,
+            "turn.start",
+            json!({"text": "Accept replacement work before crashing."}),
+        ))
+        .expect_err("accepted replacement start loses its response");
+    let persisted_after_start: Value = serde_json::from_slice(
+        &fs::read(directory.join("codex-provider-state.json"))
+            .expect("read provider state after ambiguous start"),
+    )
+    .expect("parse provider state after ambiguous start");
+    assert_eq!(persisted_after_start["completedTurnAuthoritative"], false);
+    assert!(persisted_after_start["completedTurnProcessGeneration"].is_null());
+    assert!(persisted_after_start["completedProviderTurnId"].is_null());
+
+    let mut exit_events = Vec::new();
+    for _ in 0..64 {
+        exit_events.extend(
+            poll_and_ack(&mut executor)
+                .expect("poll provider after ambiguous start")
+                .into_iter()
+                .map(|event| event.event_type),
+        );
+        if exit_events.iter().any(|event| event == "session.failed") {
+            break;
+        }
+    }
+    assert!(exit_events.iter().any(|event| event == "session.failed"));
+    assert!(!exit_events
+        .iter()
+        .any(|event| event == "session.reconciled"));
+
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn accepted_replacement_turn_revokes_prior_authority_before_idle_crash() {
+    let directory = temporary_directory("completion-then-new-turn-failure");
+    let config = provider_config(&directory, &["--fail-after-second-turn-start"]);
+    let mut provider = CodexProvider::start(&config, None).expect("start Codex provider");
+    provider
+        .start_turn("Complete the first turn.", &config.cwd)
+        .expect("start first provider turn");
+    let first_completed = (0..32).any(|_| {
+        matches!(
+            provider.poll().expect("poll first turn"),
+            Some(CodexProviderEvent::Notification { method, .. })
+                if method == "turn/completed"
+        )
+    });
+    assert!(
+        first_completed,
+        "observe the authoritative first completion"
+    );
+
+    provider
+        .start_turn("Start genuinely new provider work.", &config.cwd)
+        .expect("start second provider turn");
+    let second_exit = (0..64).find_map(|_| match provider.poll().expect("poll second turn") {
+        Some(CodexProviderEvent::Exited {
+            success,
+            completed_turn_authoritative,
+            completion_reconciles_exit,
+            ..
+        }) => Some((
+            success,
+            completed_turn_authoritative,
+            completion_reconciles_exit,
+        )),
+        _ => None,
+    });
+    assert_eq!(second_exit, Some((false, false, false)));
+
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn codex_rejects_a_tool_call_that_was_not_advertised() {
+    let directory = temporary_directory("unauthorized-tool");
+    let config = provider_config(&directory, &["--emit-tool-call"]);
+    let mut provider = CodexProvider::start(&config, None).expect("start Codex without tools");
+    provider
+        .start_turn("Attempt an unavailable tool.", &config.cwd)
+        .expect("start provider turn");
+    let error = (0..32)
+        .find_map(|_| provider.poll().err())
+        .expect("unauthorized provider tool call is rejected");
+    assert!(error.to_string().contains("unauthorized tool"));
+    let _ = provider.shutdown();
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn codex_resume_advertises_the_same_authorized_tools() {
+    let directory = temporary_directory("dynamic-tool-resume");
+    let config = provider_config(&directory, &["--require-dynamic-tool"]);
+    let mut provider =
+        CodexProvider::start_with_tools(&config, [task_context_tool()], Some("codex-thread-1"))
+            .expect("resume Codex with the run-scoped tool set");
+    assert_eq!(provider.thread_id(), "codex-thread-1");
     provider.shutdown().expect("stop provider");
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
