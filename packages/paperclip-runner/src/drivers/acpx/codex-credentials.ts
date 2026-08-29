@@ -26,8 +26,10 @@ const CREDENTIAL_LEASE_HOST = "127.0.0.1";
 const CREDENTIAL_LEASE_PORT_MIN = 49_152;
 const CREDENTIAL_LEASE_PORT_COUNT = 16_384;
 const MAX_CREDENTIAL_LEASE_PORT_CANDIDATES = 32;
-const CREDENTIAL_LEASE_PROBE_TIMEOUT_MS = 100;
+const CREDENTIAL_LEASE_PROBE_TIMEOUT_MS = 1_000;
 const CREDENTIAL_LEASE_PROTOCOL = "paperclip-managed-codex-lease-v1";
+const CREDENTIAL_LEASE_FOREIGN_PROBE =
+  "GET /__paperclip_credential_lease_probe__ HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n";
 const CREDENTIAL_LEASE_MARKER_PREFIX = ".paperclip-auth-lease-v1-";
 const MAX_CREDENTIAL_LEASE_MARKERS = 1_024;
 
@@ -53,6 +55,11 @@ interface QuarantinedCredentialCleanup {
 }
 
 type CredentialLeaseGeneration = number;
+type CredentialLeaseProbe =
+  | "matching_owner"
+  | "different_owner"
+  | "unresponsive"
+  | "unoccupied";
 
 const quarantinedCredentialCleanups = new Map<
   string,
@@ -62,6 +69,14 @@ const activeCredentialLeaseGenerations = new Map<
   string,
   CredentialLeaseGeneration
 >();
+const processCredentialLeaseState = globalThis as typeof globalThis & {
+  __paperclipCredentialLeaseIdentitiesV1?: Map<number, string>;
+};
+const processCredentialLeaseIdentities =
+  processCredentialLeaseState.__paperclipCredentialLeaseIdentitiesV1 ??
+  new Map<number, string>();
+processCredentialLeaseState.__paperclipCredentialLeaseIdentitiesV1 =
+  processCredentialLeaseIdentities;
 let nextCredentialLeaseGeneration = 0;
 
 export type ManagedCodexCredentialMode =
@@ -243,10 +258,14 @@ async function acquireCredentialHomeLock(
   // process-lifetime lease without making one hash collision authoritative.
   // The local runner also supervises its provider lifetime; a provider cannot
   // remain an authorized writer after this owning process dies. Every
-  // Paperclip listener identifies its canonical home, so collisions fall
-  // through to another candidate while a matching live owner still fences the
-  // home. After binding, probing every other candidate closes the race where
-  // an earlier unrelated listener disappears while an owner uses a later one.
+  // Paperclip listener identifies its canonical home, so confirmed unrelated
+  // collisions fall through to another candidate while a matching live owner
+  // still fences the home. An occupied endpoint that does not answer within
+  // the bounded probe is authoritative: it may be a concurrent owner between
+  // bind and marker publication, so admission fails closed instead of letting
+  // two contenders select different ports. After binding, probing every other
+  // candidate closes the race where an earlier unrelated listener disappears
+  // while an owner uses a later one.
   const identity = credentialLeaseIdentity(home);
   const ports = credentialLeasePorts(home);
   if (await hasActiveCredentialLeaseMarker(home, identity, ports)) {
@@ -262,6 +281,7 @@ async function acquireCredentialHomeLock(
     const candidate = createCredentialLeaseServer(identity, candidateSockets);
     try {
       await listenForCredentialLease(candidate, candidatePort);
+      processCredentialLeaseIdentities.set(candidatePort, identity);
       server = candidate;
       port = candidatePort;
       acceptedSockets = candidateSockets;
@@ -274,9 +294,15 @@ async function acquireCredentialHomeLock(
           { cause: error },
         );
       }
-      if (await probeCredentialLease(candidatePort, identity)) {
+      const probe = await probeCredentialLease(candidatePort, identity);
+      if (probe === "matching_owner") {
         throw new Error(
           "Managed Codex credential home already has an active lease",
+        );
+      }
+      if (probe === "unresponsive") {
+        throw new Error(
+          "Managed Codex credential ownership could not safely bypass an unresponsive lease endpoint",
         );
       }
     }
@@ -293,6 +319,9 @@ async function acquireCredentialHomeLock(
     invalid ??= error;
   });
   server.on("close", () => {
+    if (processCredentialLeaseIdentities.get(port) === identity) {
+      processCredentialLeaseIdentities.delete(port);
+    }
     if (!expectedClose) {
       invalid ??= new Error(
         "Managed Codex credential ownership listener closed unexpectedly",
@@ -312,12 +341,17 @@ async function acquireCredentialHomeLock(
         "Managed Codex credential ownership listener bound unexpectedly",
       );
     }
-    const duplicateOwner = await Promise.all(
+    const competingEndpoints = await Promise.all(
       ports
         .filter((candidatePort) => candidatePort !== port)
         .map((candidatePort) => probeCredentialLease(candidatePort, identity)),
     );
-    if (duplicateOwner.some(Boolean)) {
+    if (
+      competingEndpoints.some(
+        (probe) =>
+          probe === "matching_owner" || probe === "unresponsive",
+      )
+    ) {
       throw new Error(
         "Managed Codex credential home already has an active lease",
       );
@@ -423,33 +457,59 @@ function createCredentialLeaseServer(
 async function probeCredentialLease(
   port: number,
   expectedIdentity: string,
-): Promise<boolean> {
+): Promise<CredentialLeaseProbe> {
+  const processIdentity = processCredentialLeaseIdentities.get(port);
+  if (processIdentity !== undefined) {
+    return processIdentity === expectedIdentity
+      ? "matching_owner"
+      : "different_owner";
+  }
   const expected = `${CREDENTIAL_LEASE_PROTOCOL} ${expectedIdentity}\n`;
-  return await new Promise<boolean>((resolveProbe) => {
+  return await new Promise<CredentialLeaseProbe>((resolveProbe) => {
     const socket = createConnection({ host: CREDENTIAL_LEASE_HOST, port });
     let settled = false;
     let response = "";
-    const finish = (matches: boolean): void => {
+    let foreignProbe: NodeJS.Timeout | null = null;
+    const finish = (result: CredentialLeaseProbe): void => {
       if (settled) return;
       settled = true;
+      if (foreignProbe !== null) clearTimeout(foreignProbe);
       socket.destroy();
-      resolveProbe(matches);
+      resolveProbe(result);
     };
     socket.setEncoding("utf8");
-    socket.setTimeout(CREDENTIAL_LEASE_PROBE_TIMEOUT_MS, () => finish(false));
+    socket.setTimeout(CREDENTIAL_LEASE_PROBE_TIMEOUT_MS, () =>
+      finish("unresponsive"),
+    );
+    socket.once("connect", () => {
+      foreignProbe = setTimeout(() => {
+        if (!settled) socket.write(CREDENTIAL_LEASE_FOREIGN_PROBE);
+      }, 10);
+      foreignProbe.unref();
+    });
     socket.on("data", (chunk: string) => {
       response += chunk;
-      if (response === expected) finish(true);
+      if (response === expected) finish("matching_owner");
       else if (
         response.length >= expected.length ||
         !expected.startsWith(response)
       ) {
-        finish(false);
+        finish("different_owner");
       }
     });
-    socket.once("error", () => finish(false));
-    socket.once("end", () => finish(response === expected));
-    socket.once("close", () => finish(response === expected));
+    socket.once("error", (error) =>
+      finish(
+        errorCode(error) === "ECONNREFUSED"
+          ? "unoccupied"
+          : "unresponsive",
+      ),
+    );
+    socket.once("end", () =>
+      finish(response === expected ? "matching_owner" : "different_owner"),
+    );
+    socket.once("close", () =>
+      finish(response === expected ? "matching_owner" : "different_owner"),
+    );
   });
 }
 
@@ -477,7 +537,12 @@ async function hasActiveCredentialLeaseMarker(
     ) {
       continue;
     }
-    if (await probeCredentialLease(marker.port, expectedIdentity)) return true;
+    if (
+      (await probeCredentialLease(marker.port, expectedIdentity)) ===
+      "matching_owner"
+    ) {
+      return true;
+    }
     if (
       credentialLeaseProcessIsAlive(marker.pid) &&
       (await credentialLeasePortIsOccupied(marker.port))

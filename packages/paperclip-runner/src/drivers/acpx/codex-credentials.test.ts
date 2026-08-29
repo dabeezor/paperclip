@@ -155,6 +155,84 @@ describe("managed Codex credentials", () => {
     }
   });
 
+  it("fails closed while the primary lease owner is not yet responsive", async () => {
+    const fixture = await credentialFixture();
+    const canonicalHome = await realpath(fixture.home);
+    const primaryPort = credentialLeasePrimaryPort(canonicalHome);
+    const acceptedSockets = new Set<import("node:net").Socket>();
+    const publishingOwner = createServer((socket) => {
+      acceptedSockets.add(socket);
+      socket.once("close", () => acceptedSockets.delete(socket));
+      socket.pause();
+    });
+    await new Promise<void>((resolveListen, rejectListen) => {
+      publishingOwner.once("error", rejectListen);
+      publishingOwner.listen(primaryPort, "127.0.0.1", resolveListen);
+    });
+
+    try {
+      await expect(
+        stageManagedCodexCredential({
+          agentHomeDirectory: fixture.home,
+          environment: {
+            PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
+          },
+        }),
+      ).rejects.toThrow(
+        "could not safely bypass an unresponsive lease endpoint",
+      );
+      await expect(
+        readFile(join(fixture.home, "auth.json")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      for (const socket of acceptedSockets) socket.destroy();
+      await new Promise<void>((resolveClose, rejectClose) => {
+        publishingOwner.close((error) => {
+          if (error) rejectClose(error);
+          else resolveClose();
+        });
+      });
+    }
+  });
+
+  it("fails closed when a competing candidate is unresponsive after bind", async () => {
+    const fixture = await credentialFixture();
+    const canonicalHome = await realpath(fixture.home);
+    const competingPort = credentialLeasePort(canonicalHome, 1);
+    const acceptedSockets = new Set<import("node:net").Socket>();
+    const publishingOwner = createServer((socket) => {
+      acceptedSockets.add(socket);
+      socket.once("close", () => acceptedSockets.delete(socket));
+      socket.pause();
+    });
+    await new Promise<void>((resolveListen, rejectListen) => {
+      publishingOwner.once("error", rejectListen);
+      publishingOwner.listen(competingPort, "127.0.0.1", resolveListen);
+    });
+
+    try {
+      await expect(
+        stageManagedCodexCredential({
+          agentHomeDirectory: fixture.home,
+          environment: {
+            PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
+          },
+        }),
+      ).rejects.toThrow("already has an active lease");
+      await expect(
+        readFile(join(fixture.home, "auth.json")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      for (const socket of acceptedSockets) socket.destroy();
+      await new Promise<void>((resolveClose, rejectClose) => {
+        publishingOwner.close((error) => {
+          if (error) rejectClose(error);
+          else resolveClose();
+        });
+      });
+    }
+  });
+
   it(
     "fences another process and recovers only after its kernel lease dies",
     async () => {
@@ -764,11 +842,17 @@ async function credentialFixture(): Promise<{ root: string; home: string }> {
 }
 
 function credentialLeasePrimaryPort(home: string): number {
+  return credentialLeasePort(home, 0);
+}
+
+function credentialLeasePort(home: string, index: number): number {
   const scope = `${
     typeof process.getuid === "function" ? process.getuid() : "win32"
   }\0${home}`;
   const digest = createHash("sha256").update(scope).digest();
-  return 49_152 + (digest.readUInt16BE(0) % 16_384);
+  const start = digest.readUInt16BE(0) % 16_384;
+  const stride = digest.readUInt16BE(2) | 1;
+  return 49_152 + ((start + index * stride) % 16_384);
 }
 
 async function waitForChildMessage(
