@@ -386,6 +386,63 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  it("preserves an unresolved blocker across repeated stranded-work reconciliation", async () => {
+    const { companyId, coderId, sourceIssue } = await seedCompany();
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Restore the source execution path",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: null,
+      issueNumber: 2,
+      identifier: "TEST-2",
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: sourceIssue.id,
+      type: "blocks",
+    });
+
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: {
+        issueId: sourceIssue.id,
+        retryReason: "issue_continuation_needed",
+      },
+      livenessState: "needs_followup",
+    });
+
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, sourceIssue.id));
+      const result = await recovery.reconcileStrandedAssignedIssues();
+      expect(result).toMatchObject({ escalated: 1, issueIds: [sourceIssue.id] });
+
+      const blockerRows = await db
+        .select({ blockerIssueId: issueRelations.issueId })
+        .from(issueRelations)
+        .where(and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.relatedIssueId, sourceIssue.id),
+          eq(issueRelations.type, "blocks"),
+        ));
+      expect(blockerRows).toEqual([{ blockerIssueId }]);
+    }
+  });
+
   // Model the production payload: `requestedRef` keeps the operator spelling,
   // and the fingerprint carries the canonical remote ref. Two equivalent
   // spellings of one remote branch share `identityRef`, so they share one
