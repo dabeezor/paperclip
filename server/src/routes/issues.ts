@@ -255,6 +255,7 @@ import {
 } from "../services/issue-thread-interaction-resolution.js";
 import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
 import {
+  adoptCheckedOutIssueAsRunSource,
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
   observeCrossIssueInfluence,
@@ -11113,6 +11114,18 @@ export function issueRoutes(
       entityId: issue.id,
       details: { agentId: req.body.agentId },
     });
+
+    // Timer wakes have no issueId in contextSnapshot. Stamp the checked-out
+    // issue as this run's source so comment/status writes do not 403 with
+    // cross_issue_influence_run_context_required on the just-checked-out issue.
+    if (req.actor.type === "agent" && req.actor.agentId && checkoutRunId && updated) {
+      await adoptCheckedOutIssueAsRunSource(db, {
+        companyId: issue.companyId,
+        runId: checkoutRunId,
+        agentId: req.actor.agentId,
+        issueId: issue.id,
+      }).catch((err) => logger.warn({ err, issueId: issue.id, checkoutRunId }, "failed to adopt checkout as run source"));
+    }
 
     if (
       shouldWakeAssigneeOnCheckout({

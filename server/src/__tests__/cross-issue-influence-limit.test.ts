@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
   CROSS_ISSUE_INFLUENCE_LIMIT,
+  adoptCheckedOutIssueAsRunSource,
   crossIssueInfluenceLimitError,
   evaluateCrossIssueInfluenceLimit,
   observeCrossIssueInfluence,
@@ -10,9 +11,19 @@ import {
 function counterDb(
   initialCount = 0,
   runOverrides: Record<string, unknown> | null = {},
+  issueRow: Record<string, unknown> | null = null,
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
+  const updates: Array<Record<string, unknown>> = [];
+  let runState: Record<string, unknown> | null = runOverrides === null ? null : {
+    id: "11111111-1111-4111-8111-111111111111",
+    companyId: "22222222-2222-4222-8222-222222222222",
+    agentId: "33333333-3333-4333-8333-333333333333",
+    responsibleUserId: "user-1",
+    contextSnapshot: { issueId: "44444444-4444-4444-8444-444444444444" },
+    ...runOverrides,
+  };
   const tx = {
     select: (selection: Record<string, unknown>) => ({
       from: () => ({
@@ -22,16 +33,14 @@ function counterDb(
               then: (resolve: (rows: unknown[]) => unknown) => resolve([{ count: observedCount }]),
             };
           }
+          if (Object.keys(selection).includes("checkoutRunId")) {
+            return {
+              then: (resolve: (rows: unknown[]) => unknown) => resolve(issueRow ? [issueRow] : []),
+            };
+          }
           return {
             for: () => ({
-              then: (resolve: (rows: unknown[]) => unknown) => resolve(runOverrides === null ? [] : [{
-                id: "11111111-1111-4111-8111-111111111111",
-                companyId: "22222222-2222-4222-8222-222222222222",
-                agentId: "33333333-3333-4333-8333-333333333333",
-                responsibleUserId: "user-1",
-                contextSnapshot: { issueId: "44444444-4444-4444-8444-444444444444" },
-                ...runOverrides,
-              }]),
+              then: (resolve: (rows: unknown[]) => unknown) => resolve(runState ? [runState] : []),
             }),
           };
         },
@@ -43,14 +52,29 @@ function counterDb(
         if (value.action === "issue.cross_issue_influence_observed") observedCount += 1;
       },
     }),
+    update: () => ({
+      set: (value: Record<string, unknown>) => ({
+        where: async () => {
+          updates.push(value);
+          if (runState && value.contextSnapshot) {
+            runState = { ...runState, contextSnapshot: value.contextSnapshot };
+          }
+          return [];
+        },
+      }),
+    }),
   };
   return {
     db: {
       transaction: async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx),
     },
     inserted,
+    updates,
     get observedCount() {
       return observedCount;
+    },
+    get runState() {
+      return runState;
     },
   };
 }
@@ -198,7 +222,7 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
-  it("fails closed when the persisted run has no source issue", async () => {
+  it("fails closed when the persisted run has no source issue and the target is not checked out to it", async () => {
     const fake = counterDb(0, { contextSnapshot: {} });
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
@@ -212,5 +236,49 @@ describe("cross-issue influence limit rollout", () => {
       details: { code: "cross_issue_influence_run_context_required" },
     });
     expect(fake.inserted).toEqual([]);
+  });
+
+  it("adopts a same-run checkout as the source when timer wake context has no issueId", async () => {
+    const targetIssueId = "55555555-5555-4555-8555-555555555555";
+    const runId = "11111111-1111-4111-8111-111111111111";
+    const fake = counterDb(
+      0,
+      { contextSnapshot: { source: "scheduler", wakeReason: "heartbeat_timer" } },
+      { id: targetIssueId, checkoutRunId: runId },
+    );
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId,
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId,
+      kind: "comment",
+    })).resolves.toBeNull();
+    expect(fake.inserted).toEqual([]);
+    expect(fake.updates).toEqual([
+      expect.objectContaining({
+        contextSnapshot: expect.objectContaining({
+          issueId: targetIssueId,
+          taskId: targetIssueId,
+          source: "scheduler",
+        }),
+      }),
+    ]);
+  });
+
+  it("stamps a missing source onto the run during checkout adoption", async () => {
+    const fake = counterDb(0, { contextSnapshot: { wakeReason: "heartbeat_timer" } });
+    await expect(adoptCheckedOutIssueAsRunSource(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      issueId: "55555555-5555-4555-8555-555555555555",
+    })).resolves.toBe(true);
+    expect(fake.updates[0]?.contextSnapshot).toMatchObject({
+      issueId: "55555555-5555-4555-8555-555555555555",
+      taskId: "55555555-5555-4555-8555-555555555555",
+      source: "issue.checkout",
+      wakeReason: "heartbeat_timer",
+    });
   });
 });

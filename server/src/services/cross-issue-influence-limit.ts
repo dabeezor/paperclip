@@ -1,6 +1,6 @@
 import { and, count, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -41,6 +41,72 @@ function readRunSourceIssueId(contextSnapshot: unknown) {
     if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
   }
   return null;
+}
+
+function mergeRunSourceIssueContext(
+  contextSnapshot: unknown,
+  issueId: string,
+  source: string,
+): Record<string, unknown> {
+  const prior =
+    contextSnapshot && typeof contextSnapshot === "object" && !Array.isArray(contextSnapshot)
+      ? { ...(contextSnapshot as Record<string, unknown>) }
+      : {};
+  return {
+    ...prior,
+    issueId,
+    taskId: typeof prior.taskId === "string" && prior.taskId.trim() ? prior.taskId : issueId,
+    source: typeof prior.source === "string" && prior.source.trim() ? prior.source : source,
+  };
+}
+
+/**
+ * Timer / scheduler wakes start with no `issueId`/`taskId` in contextSnapshot.
+ * When that same run checks out an issue, stamp the checked-out issue as the
+ * run source so later comment/status writes pass the influence gate.
+ */
+export async function adoptCheckedOutIssueAsRunSource(
+  db: Db,
+  input: {
+    companyId: string;
+    runId: string;
+    agentId: string;
+    issueId: string;
+    source?: string;
+  },
+): Promise<boolean> {
+  if (!isUuidLike(input.runId)) return false;
+  return db.transaction(async (tx) => {
+    const run = await tx
+      .select({
+        id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, input.runId),
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+      ))
+      .for("update")
+      .then((rows) => rows[0] ?? null);
+    if (!run) return false;
+    if (readRunSourceIssueId(run.contextSnapshot)) return false;
+    await tx
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: mergeRunSourceIssueContext(
+          run.contextSnapshot,
+          input.issueId,
+          input.source ?? "issue.checkout",
+        ),
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, run.id));
+    return true;
+  });
 }
 
 export function evaluateCrossIssueInfluenceLimit(input: {
@@ -109,8 +175,43 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError();
     }
 
-    const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    let sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+    if (!sourceIssueId) {
+      // Timer wakes have no source issue until checkout. If this run already
+      // checked out the target, adopt that checkout as the run source rather
+      // than 403'ing same-run comment/status writes.
+      const checkedOut = await tx
+        .select({ id: issues.id, checkoutRunId: issues.checkoutRunId })
+        .from(issues)
+        .where(and(
+          eq(issues.id, input.targetIssueId),
+          eq(issues.companyId, input.companyId),
+          eq(issues.checkoutRunId, input.runId),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (!checkedOut) throw crossIssueInfluenceRunContextError();
+      const nextContext = mergeRunSourceIssueContext(
+        run.contextSnapshot,
+        input.targetIssueId,
+        "issue.checkout_adopted_as_run_source",
+      );
+      await tx
+        .update(heartbeatRuns)
+        .set({
+          contextSnapshot: nextContext,
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, run.id));
+      sourceIssueId = input.targetIssueId;
+      logger.info({
+        event: "cross_issue_influence_source_adopted",
+        companyId: input.companyId,
+        runId: input.runId,
+        agentId: input.agentId,
+        sourceIssueId,
+        kind: input.kind,
+      }, "adopted checked-out issue as heartbeat run source");
+    }
     if (
       sourceIssueId === input.targetIssueId ||
       (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
