@@ -1,7 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createServer } from "node:http";
 import { and, asc, eq } from "drizzle-orm";
-import { WebSocketServer } from "ws";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
@@ -20,6 +18,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.ts";
 import { parseWakePayloadFromMessage } from "./helpers/wake-message.ts";
+import { createControlledGatewayServer } from "./helpers/controlled-gateway-server.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -41,123 +40,6 @@ async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs = 
 
 async function closeDbClient(db: ReturnType<typeof createDb> | undefined) {
   await db?.$client?.end?.({ timeout: 0 });
-}
-
-async function createControlledGatewayServer() {
-  const server = createServer();
-  const wss = new WebSocketServer({ server });
-  const agentPayloads: Array<Record<string, unknown>> = [];
-  let firstWaitRelease: (() => void) | null = null;
-  let firstWaitGate = new Promise<void>((resolve) => {
-    firstWaitRelease = resolve;
-  });
-  let waitCount = 0;
-
-  wss.on("connection", (socket) => {
-    socket.send(
-      JSON.stringify({
-        type: "event",
-        event: "connect.challenge",
-        payload: { nonce: "nonce-123" },
-      }),
-    );
-
-    socket.on("message", async (raw) => {
-      const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
-      const frame = JSON.parse(text) as {
-        type: string;
-        id: string;
-        method: string;
-        params?: Record<string, unknown>;
-      };
-
-      if (frame.type !== "req") return;
-
-      if (frame.method === "connect") {
-        socket.send(
-          JSON.stringify({
-            type: "res",
-            id: frame.id,
-            ok: true,
-            payload: {
-              type: "hello-ok",
-              protocol: 3,
-              server: { version: "test", connId: "conn-1" },
-              features: { methods: ["connect", "agent", "agent.wait"], events: ["agent"] },
-              snapshot: { version: 1, ts: Date.now() },
-              policy: { maxPayload: 1_000_000, maxBufferedBytes: 1_000_000, tickIntervalMs: 30_000 },
-            },
-          }),
-        );
-        return;
-      }
-
-      if (frame.method === "agent") {
-        agentPayloads.push((frame.params ?? {}) as Record<string, unknown>);
-        const runId =
-          typeof frame.params?.idempotencyKey === "string"
-            ? frame.params.idempotencyKey
-            : `run-${agentPayloads.length}`;
-
-        socket.send(
-          JSON.stringify({
-            type: "res",
-            id: frame.id,
-            ok: true,
-            payload: {
-              runId,
-              status: "accepted",
-              acceptedAt: Date.now(),
-            },
-          }),
-        );
-        return;
-      }
-
-      if (frame.method === "agent.wait") {
-        waitCount += 1;
-        if (waitCount === 1) {
-          await firstWaitGate;
-        }
-        socket.send(
-          JSON.stringify({
-            type: "res",
-            id: frame.id,
-            ok: true,
-            payload: {
-              runId: frame.params?.runId,
-              status: "ok",
-              startedAt: 1,
-              endedAt: 2,
-            },
-          }),
-        );
-      }
-    });
-  });
-
-  await new Promise<void>((resolve) => {
-    server.listen(0, "127.0.0.1", () => resolve());
-  });
-
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    throw new Error("Failed to resolve test server address");
-  }
-
-  return {
-    url: `ws://127.0.0.1:${address.port}`,
-    getAgentPayloads: () => agentPayloads,
-    releaseFirstWait: () => {
-      firstWaitRelease?.();
-      firstWaitRelease = null;
-      firstWaitGate = Promise.resolve();
-    },
-    close: async () => {
-      await new Promise<void>((resolve) => wss.close(() => resolve()));
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
-  };
 }
 
 describeEmbeddedPostgres("heartbeat comment wake batching", () => {

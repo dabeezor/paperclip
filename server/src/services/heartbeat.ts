@@ -274,6 +274,12 @@ import {
 } from "./runner-goals.js";
 import { projectService } from "./projects.js";
 import {
+  HARNESS_AUTO_CHECKOUT_ISSUE_STATUSES,
+  describeHarnessCheckoutBlock,
+  resolveHarnessCheckoutBlock,
+  type HarnessCheckoutBlockReason,
+} from "./harness-checkout-gate.js";
+import {
   authorizationService,
   type AuthorizationActor,
 } from "./authorization.js";
@@ -519,6 +525,12 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
+  // The harness writes these itself, before the agent does anything. Counting
+  // them as run evidence would tell the liveness classifier that every
+  // harness-claimed run produced concrete action, which suppresses the
+  // plan-only and empty-response continuations that recovery depends on.
+  "issue.checked_out",
+  "issue.harness_checkout_skipped",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
@@ -6584,7 +6596,16 @@ export function resolveTaskSessionConfigFreshness(input: {
   };
 }
 
-export function shouldAutoCheckoutIssueForWake(input: {
+/**
+ * Wake-shape eligibility for a harness claim, before the project/issue-status
+ * gate is applied.
+ *
+ * This answers "is this the kind of wake that would claim the issue at all".
+ * It is separate from the gate so a caller can tell a wake that the gate
+ * refused apart from a wake that was never going to claim anything. Only the
+ * first is worth an activity record.
+ */
+export function isWakeShapeEligibleForHarnessCheckout(input: {
   contextSnapshot: Record<string, unknown> | null | undefined;
   issueStatus: string | null;
   issueAssigneeAgentId: string | null;
@@ -6614,6 +6635,32 @@ export function shouldAutoCheckoutIssueForWake(input: {
   if (wakeReason.startsWith("execution_")) return false;
 
   return true;
+}
+
+export function shouldAutoCheckoutIssueForWake(input: {
+  contextSnapshot: Record<string, unknown> | null | undefined;
+  issueStatus: string | null;
+  issueAssigneeAgentId: string | null;
+  issueExecutionState?: unknown;
+  isDependencyReady: boolean;
+  agentId: string;
+  /** True when the issue belongs to a project. An issue with no project is unaffected. */
+  issueHasProject?: boolean;
+  /** The status of that project, read from the `projects` row, not from a list endpoint. */
+  issueProjectStatus?: string | null;
+}) {
+  if (!isWakeShapeEligibleForHarnessCheckout(input)) return false;
+
+  // `backlog` is not claimable: the harness must not pull an unscheduled issue
+  // into `in_progress`. An operator parks a project by moving it out of
+  // `in_progress`, and the harness honours that for every issue in it.
+  return (
+    resolveHarnessCheckoutBlock({
+      issueStatus: input.issueStatus,
+      hasProject: input.issueHasProject ?? false,
+      projectStatus: input.issueProjectStatus ?? null,
+    }) === null
+  );
 }
 
 export function shouldQueueFollowupForRunningIssueWake(input: {
@@ -9109,6 +9156,70 @@ export function heartbeatService(
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
       .then((rows) => rows[0] ?? null);
+  }
+
+  /**
+   * Read the status of the project an issue belongs to.
+   *
+   * The read goes to the `projects` row itself, by id. It deliberately does not
+   * reuse an issue list response: `GET /api/companies/{companyId}/issues` does
+   * not populate a project object, so a caller that reads project status from a
+   * list response reads an empty field and passes a gate it should fail.
+   *
+   * Returns `null` when the issue has no project, and `null` when the project
+   * row is missing. The caller distinguishes the two with `hasProject`.
+   */
+  async function getProjectStatusForIssue(
+    companyId: string,
+    projectId: string | null,
+  ): Promise<string | null> {
+    if (!projectId) return null;
+    return db
+      .select({ status: projects.status })
+      .from(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
+      .then((rows) => rows[0]?.status ?? null);
+  }
+
+  /**
+   * Write an activity record for a status transition the run harness makes.
+   *
+   * The harness calls `issuesSvc.checkout` directly instead of going through
+   * `POST /api/issues/:id/checkout`, so it does not inherit the route's
+   * `logActivity` call. Without this helper a harness claim moves an issue to
+   * `in_progress` with no entry in `GET /api/issues/:id/activity`, which makes
+   * the transition impossible to attribute after the fact.
+   *
+   * The audit write never fails the run. A failed audit write is logged and
+   * swallowed, because losing one record is better than killing a live run.
+   */
+  async function recordHarnessCheckoutActivity(input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    issueId: string;
+    action: "issue.checked_out" | "issue.harness_checkout_skipped";
+    details: Record<string, unknown>;
+  }) {
+    try {
+      await logActivity(db, {
+        companyId: input.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: input.agentId,
+        runId: input.runId,
+        action: input.action,
+        entityType: "issue",
+        entityId: input.issueId,
+        issueId: input.issueId,
+        details: { ...input.details, actor: "run_harness" },
+      });
+    } catch (error) {
+      logger.warn(
+        { error, issueId: input.issueId, runId: input.runId, action: input.action },
+        "harness checkout activity record could not be written",
+      );
+    }
   }
 
   async function getPinnedSkillTestContext(companyId: string, issueId: string) {
@@ -17682,11 +17793,18 @@ export function heartbeatService(
             .listDependencyReadiness(agent.companyId, [issueId])
             .then((rows) => rows.get(issueId) ?? null)
         : null;
+      // Read the project status by project id, not from a list response. The
+      // harness gate below fails closed when the issue has a project and this
+      // read returns null.
+      const issueProjectStatus = issueContext
+        ? await getProjectStatusForIssue(agent.companyId, issueContext.projectId)
+        : null;
       if (
         issueId &&
         issueContext &&
         isResolvedInteractionContinuationWakeContext(context)
       ) {
+        const statusBeforeContinuationCheckout = issueContext.status;
         try {
           // Claim the issue under the same active-status predicate used by the
           // queued-run staleness gate. This is the final atomic guard before
@@ -17695,6 +17813,22 @@ export function heartbeatService(
           await issuesSvc.checkout(issueId, agent.id, context.interactionKind === "connection_intent"
             ? ["in_progress", "in_review"] : ["in_progress"], run.id);
           context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
+          await recordHarnessCheckoutActivity({
+            companyId: agent.companyId,
+            agentId: agent.id,
+            runId: run.id,
+            issueId,
+            action: "issue.checked_out",
+            details: {
+              agentId: agent.id,
+              source: "harness_interaction_continuation",
+              fromStatus: statusBeforeContinuationCheckout,
+              toStatus: "in_progress",
+              projectId: issueContext.projectId ?? null,
+              projectStatus: issueProjectStatus,
+              wakeReason: readNonEmptyString(context.wakeReason),
+            },
+          });
         } catch (error) {
           if (!isCheckoutConflictError(error)) throw error;
           const staleness = await runDispatch.cancelStaleQueuedRun({
@@ -17710,9 +17844,51 @@ export function heartbeatService(
         }
         issueContext = await getIssueExecutionContext(agent.companyId, issueId);
       }
+      // Resolve the project/issue-status gate before the auto-checkout branch.
+      // It is resolved only for a wake that would otherwise have claimed the
+      // issue, so a wake that was never going to claim anything does not write
+      // a skip record on every heartbeat.
+      const harnessCheckoutBlock: HarnessCheckoutBlockReason | null =
+        issueId &&
+        issueContext &&
+        !isResolvedInteractionContinuationWakeContext(context) &&
+        isWakeShapeEligibleForHarnessCheckout({
+          contextSnapshot: context,
+          issueStatus: issueContext.status,
+          issueAssigneeAgentId: issueContext.assigneeAgentId,
+          issueExecutionState: issueContext.executionState,
+          isDependencyReady:
+            issueDependencyReadiness?.isDependencyReady ?? true,
+          agentId: agent.id,
+        })
+          ? resolveHarnessCheckoutBlock({
+              issueStatus: issueContext.status,
+              hasProject: Boolean(issueContext.projectId),
+              projectStatus: issueProjectStatus,
+            })
+          : null;
+      if (issueId && issueContext && harnessCheckoutBlock) {
+        context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = false;
+        await recordHarnessCheckoutActivity({
+          companyId: agent.companyId,
+          agentId: agent.id,
+          runId: run.id,
+          issueId,
+          action: "issue.harness_checkout_skipped",
+          details: {
+            reason: harnessCheckoutBlock,
+            message: describeHarnessCheckoutBlock(harnessCheckoutBlock),
+            issueStatus: issueContext.status,
+            projectId: issueContext.projectId ?? null,
+            projectStatus: issueProjectStatus,
+            wakeReason: readNonEmptyString(context.wakeReason),
+          },
+        });
+      }
       if (
         issueId &&
         issueContext &&
+        !harnessCheckoutBlock &&
         !isResolvedInteractionContinuationWakeContext(context) &&
         shouldAutoCheckoutIssueForWake({
           contextSnapshot: context,
@@ -17722,13 +17898,16 @@ export function heartbeatService(
           isDependencyReady:
             issueDependencyReadiness?.isDependencyReady ?? true,
           agentId: agent.id,
+          issueHasProject: Boolean(issueContext.projectId),
+          issueProjectStatus,
         })
       ) {
+        const statusBeforeCheckout = issueContext.status;
         try {
           await issuesSvc.checkout(
             issueId,
             agent.id,
-            ["todo", "backlog", "blocked"],
+            [...HARNESS_AUTO_CHECKOUT_ISSUE_STATUSES],
             run.id,
           );
           context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
@@ -17737,6 +17916,24 @@ export function heartbeatService(
           context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = false;
         }
         issueContext = await getIssueExecutionContext(agent.companyId, issueId);
+        if (context[PAPERCLIP_HARNESS_CHECKOUT_KEY] === true) {
+          await recordHarnessCheckoutActivity({
+            companyId: agent.companyId,
+            agentId: agent.id,
+            runId: run.id,
+            issueId,
+            action: "issue.checked_out",
+            details: {
+              agentId: agent.id,
+              source: "harness_auto_checkout",
+              fromStatus: statusBeforeCheckout,
+              toStatus: issueContext?.status ?? "in_progress",
+              projectId: issueContext?.projectId ?? null,
+              projectStatus: issueProjectStatus,
+              wakeReason: readNonEmptyString(context.wakeReason),
+            },
+          });
+        }
       }
       const wakeCommentId = deriveCommentId(context, null);
       const wakeCommentContext =

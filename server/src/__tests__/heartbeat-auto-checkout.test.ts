@@ -12,6 +12,68 @@ describe("shouldAutoCheckoutIssueForWake", () => {
     })).toBe(true);
   });
 
+  it("auto-checks out a todo issue whose project is in_progress", () => {
+    expect(shouldAutoCheckoutIssueForWake({
+      contextSnapshot: { wakeReason: "issue_assigned" },
+      issueStatus: "todo",
+      issueAssigneeAgentId: "agent-1",
+      isDependencyReady: true,
+      agentId: "agent-1",
+      issueHasProject: true,
+      issueProjectStatus: "in_progress",
+    })).toBe(true);
+  });
+
+  it("does not auto-checkout an issue whose own status is backlog", () => {
+    expect(shouldAutoCheckoutIssueForWake({
+      contextSnapshot: { wakeReason: "issue_assigned" },
+      issueStatus: "backlog",
+      issueAssigneeAgentId: "agent-1",
+      isDependencyReady: true,
+      agentId: "agent-1",
+      issueHasProject: true,
+      issueProjectStatus: "in_progress",
+    })).toBe(false);
+  });
+
+  it("does not auto-checkout an issue whose project status is not in_progress", () => {
+    for (const projectStatus of ["backlog", "planned", "completed", "cancelled"]) {
+      expect(shouldAutoCheckoutIssueForWake({
+        contextSnapshot: { wakeReason: "issue_assigned" },
+        issueStatus: "todo",
+        issueAssigneeAgentId: "agent-1",
+        isDependencyReady: true,
+        agentId: "agent-1",
+        issueHasProject: true,
+        issueProjectStatus: projectStatus,
+      })).toBe(false);
+    }
+  });
+
+  it("does not auto-checkout an in_progress issue whose project is parked", () => {
+    expect(shouldAutoCheckoutIssueForWake({
+      contextSnapshot: { wakeReason: "issue_status_changed" },
+      issueStatus: "in_progress",
+      issueAssigneeAgentId: "agent-1",
+      isDependencyReady: true,
+      agentId: "agent-1",
+      issueHasProject: true,
+      issueProjectStatus: "backlog",
+    })).toBe(false);
+  });
+
+  it("still auto-checks out an issue that belongs to no project", () => {
+    expect(shouldAutoCheckoutIssueForWake({
+      contextSnapshot: { wakeReason: "issue_assigned" },
+      issueStatus: "todo",
+      issueAssigneeAgentId: "agent-1",
+      isDependencyReady: true,
+      agentId: "agent-1",
+      issueHasProject: false,
+      issueProjectStatus: null,
+    })).toBe(true);
+  });
+
   it("does not auto-checkout pending execution-review state even if the row status is todo", () => {
     const reviewerAgentId = "11111111-1111-4111-8111-111111111111";
     const coderAgentId = "22222222-2222-4222-8222-222222222222";
