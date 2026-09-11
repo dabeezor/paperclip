@@ -44,6 +44,21 @@ describe("buildNetworkPolicyManifests", () => {
     expect(cidrRule).toBeDefined();
   });
 
+  it("limits port-scoped CIDRs to the requested TCP port", () => {
+    const [, egress] = buildNetworkPolicyManifests({
+      ...baseInput,
+      egressAllowTcpCidrs: [{ cidr: "10.10.10.140/32", port: 3389 }],
+    });
+    const cidrRule = egress.spec.egress.find((r: {
+      to: { ipBlock?: { cidr: string } }[];
+      ports?: { protocol: string; port: number }[];
+    }) => r.to.some((t) => t.ipBlock?.cidr === "10.10.10.140/32"));
+    expect(cidrRule).toEqual({
+      to: [{ ipBlock: { cidr: "10.10.10.140/32" } }],
+      ports: [{ protocol: "TCP", port: 3389 }],
+    });
+  });
+
   it("uses paperclip-server pod label selector for callback ingress to paperclip ns", () => {
     const [, egress] = buildNetworkPolicyManifests(baseInput);
     const callbackRule = egress.spec.egress.find((r: { to: { podSelector?: { matchLabels?: Record<string, string> } }[] }) =>

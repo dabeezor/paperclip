@@ -203,6 +203,15 @@ export function parseIssueExecutionWorkspaceSettings(
       .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
       .map((value) => value.trim())
     : [];
+  const allowTcpCidrs = Array.isArray(networkEgress.allowTcpCidrs)
+    ? networkEgress.allowTcpCidrs
+      .filter((value): value is { cidr: string; port: number } => (
+        Boolean(value) && typeof value === "object" && !Array.isArray(value)
+        && typeof (value as Record<string, unknown>).cidr === "string"
+        && typeof (value as Record<string, unknown>).port === "number"
+      ))
+      .map((value) => ({ cidr: value.cidr.trim(), port: value.port }))
+    : [];
   return {
     ...(normalizedMode
       ? { mode: normalizedMode as IssueExecutionWorkspaceSettings["mode"] }
@@ -215,8 +224,8 @@ export function parseIssueExecutionWorkspaceSettings(
     ...(parsed.workspaceRuntime && typeof parsed.workspaceRuntime === "object" && !Array.isArray(parsed.workspaceRuntime)
       ? { workspaceRuntime: { ...(parsed.workspaceRuntime as Record<string, unknown>) } }
       : {}),
-    ...(allowFqdns.length > 0 || allowCidrs.length > 0
-      ? { networkEgress: { allowFqdns, allowCidrs } }
+    ...(allowFqdns.length > 0 || allowCidrs.length > 0 || allowTcpCidrs.length > 0
+      ? { networkEgress: { allowFqdns, allowCidrs, allowTcpCidrs } }
       : {}),
   };
 }

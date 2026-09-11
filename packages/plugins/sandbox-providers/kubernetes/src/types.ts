@@ -94,6 +94,7 @@ export interface KubernetesLeaseMetadata {
   scopedNetworkEgress: {
     allowFqdns: string[];
     allowCidrs: string[];
+    allowTcpCidrs: Array<{ cidr: string; port: number }>;
   };
   /**
    * True when this lease's backend has NO data channel for the native file-sync

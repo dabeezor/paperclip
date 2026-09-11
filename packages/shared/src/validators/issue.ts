@@ -207,6 +207,13 @@ export const issueExecutionWorkspaceSettingsSchema = z
         isAllowedTaskEgressCidr,
         "Task-scoped network egress CIDRs cannot overlap private, loopback, link-local, CGNAT, or multicast ranges",
       )).max(100).optional(),
+      allowTcpCidrs: z.array(z.object({
+        cidr: z.string().trim().regex(
+          ipv4CidrPattern,
+          "Invalid IPv4 CIDR (must use octets 0-255 and prefix 0-32)",
+        ).max(64),
+        port: z.number().int().min(1).max(65535),
+      }).strict()).max(100).optional(),
     }).strict().optional().nullable(),
   })
   .strict()

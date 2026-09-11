@@ -395,6 +395,7 @@ describe("execution workspace policy helpers", () => {
         networkEgress: {
           allowFqdns: ["github.com", "pypi.org"],
           allowCidrs: ["203.0.113.0/24"],
+          allowTcpCidrs: [{ cidr: "10.10.10.140/32", port: 3389 }],
         },
       }),
     ).toEqual({
@@ -403,6 +404,7 @@ describe("execution workspace policy helpers", () => {
       networkEgress: {
         allowFqdns: ["github.com", "pypi.org"],
         allowCidrs: ["203.0.113.0/24"],
+        allowTcpCidrs: [{ cidr: "10.10.10.140/32", port: 3389 }],
       },
     });
   });

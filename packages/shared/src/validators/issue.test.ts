@@ -132,6 +132,19 @@ describe("issue validators", () => {
     }).success).toBe(false);
   });
 
+  it("accepts port-scoped CIDRs and keeps their TCP ports bounded", () => {
+    expect(updateIssueSchema.safeParse({
+      executionWorkspaceSettings: {
+        networkEgress: { allowTcpCidrs: [{ cidr: "10.10.10.140/32", port: 3389 }] },
+      },
+    }).success).toBe(true);
+    expect(updateIssueSchema.safeParse({
+      executionWorkspaceSettings: {
+        networkEgress: { allowTcpCidrs: [{ cidr: "10.10.10.140/32", port: 0 }] },
+      },
+    }).success).toBe(false);
+  });
+
   it("accepts a lazy runtime provision command in workspace settings", () => {
     const parsed = updateIssueSchema.parse({
       executionWorkspaceSettings: {

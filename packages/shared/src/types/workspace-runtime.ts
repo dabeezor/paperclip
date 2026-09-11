@@ -189,6 +189,8 @@ export interface IssueExecutionWorkspaceSettings {
   networkEgress?: {
     allowFqdns?: string[];
     allowCidrs?: string[];
+    /** Private or public IPv4 CIDRs limited to one TCP destination port. */
+    allowTcpCidrs?: Array<{ cidr: string; port: number }>;
   } | null;
 }
 

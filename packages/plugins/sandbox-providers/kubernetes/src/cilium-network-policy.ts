@@ -3,6 +3,7 @@ export interface BuildCiliumNetworkPolicyInput {
   paperclipServerNamespace: string;
   egressAllowFqdns: string[];
   egressAllowCidrs: string[];
+  egressAllowTcpCidrs?: Array<{ cidr: string; port: number }>;
   name?: string;
   endpointSelector?: Record<string, string>;
   includeBaseRules?: boolean;
@@ -53,6 +54,13 @@ export function buildCiliumNetworkPolicyManifest(input: BuildCiliumNetworkPolicy
   if (input.egressAllowCidrs.length > 0) {
     egress.push({
       toCIDRSet: input.egressAllowCidrs.map((cidr) => ({ cidr })),
+    });
+  }
+
+  for (const { cidr, port } of input.egressAllowTcpCidrs ?? []) {
+    egress.push({
+      toCIDRSet: [{ cidr }],
+      toPorts: [{ ports: [{ port: String(port), protocol: "TCP" }] }],
     });
   }
 
