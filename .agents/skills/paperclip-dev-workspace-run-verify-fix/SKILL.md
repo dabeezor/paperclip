@@ -35,7 +35,7 @@ passed.
 
 ## Hard rules
 
-- The master checkout `/srv/paperclip/home/paperclipai/paperclip` (the primary
+- The master checkout `<paperclip-primary-checkout>` (the primary
   repo with the real instance `.env`) is never a workspace repair target. Never
   point a worktree runtime service at it, never `git worktree add` into it or
   under `<master>/.paperclip/worktrees/`, and never edit its `.env` while
