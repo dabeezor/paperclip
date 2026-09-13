@@ -2010,6 +2010,22 @@ async function buildRuntime(input: {
   });
   let agentCommand = configuredCommand || builtInCommand?.command || null;
   let agentCommandShell = configuredCommand || builtInCommand?.shellCommand || "";
+  // Gemini's own ACP server does not implement session/set_config_option (it
+  // replies "Method not found", ACP -32601), so the model must be set via the
+  // `-m`/`--model` startup flag instead, the same way claude/codex use a
+  // startup env var. Only append when the built-in command was used and the
+  // caller did not already specify a model flag of their own.
+  if (
+    acpxAgent === "gemini" &&
+    !configuredCommand &&
+    requestedModel &&
+    agentCommand &&
+    agentCommandShell
+  ) {
+    const modelFlag = ` -m ${shellQuote(requestedModel)}`;
+    agentCommand = `${agentCommand}${modelFlag}`;
+    agentCommandShell = `${agentCommandShell}${modelFlag}`;
+  }
   // A runner-backed remote sandbox is the only lane that crosses the staging
   // and serialized-launch-env seam. Runner-less ACP→CLI fallback, SSH, and
   // local runs keep their historical host-provider compatibility behavior.
@@ -2437,11 +2453,14 @@ function sessionConfigOptions(prepared: AcpxPreparedRuntime): Array<{ key: strin
   const options: Array<{ key: string; value: string }> = [];
   // Claude and Codex runtime config is pre-set via startup env vars; skip
   // set_config_option to avoid ACP-server picker validation rejecting valid
-  // backend model IDs that are not advertised by the local ACP server.
+  // backend model IDs that are not advertised by the local ACP server. Gemini
+  // is pre-set via the `-m` startup flag (see agentCommand construction above)
+  // because its ACP server does not implement session/set_config_option at all.
   if (
     prepared.requestedModel &&
     prepared.acpxAgent !== "claude" &&
-    prepared.acpxAgent !== "codex"
+    prepared.acpxAgent !== "codex" &&
+    prepared.acpxAgent !== "gemini"
   ) {
     options.push({ key: "model", value: prepared.requestedModel });
   }

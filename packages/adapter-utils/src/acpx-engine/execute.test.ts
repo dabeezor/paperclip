@@ -533,22 +533,27 @@ describe("shared ACPX engine runtime behavior", () => {
     });
   });
 
-  it("keeps Claude startup model handling and Gemini session config handling unchanged", async () => {
+  it("sets Claude and Gemini models via startup args, not session/set_config_option", async () => {
     const claude = await runExecutor({ agent: "claude", model: "claude-opus-4-7" });
     expect((claude.meta[0]?.env as Record<string, string>).ANTHROPIC_MODEL).toBe(
       "claude-opus-4-7",
     );
     expect(claude.configOptions).toEqual([]);
 
+    // Gemini's ACP server does not implement session/set_config_option (it
+    // replies "Method not found"), so the model is passed via the `-m`
+    // startup flag instead; only effort still goes through set_config_option.
     const gemini = await runExecutor({
       agent: "gemini",
       model: "gemini-2.5-pro",
       thinkingEffort: "high",
     });
-    expect(gemini.configOptions).toEqual([
-      { key: "model", value: "gemini-2.5-pro" },
-      { key: "effort", value: "high" },
-    ]);
+    expect(gemini.configOptions).toEqual([{ key: "effort", value: "high" }]);
+    expect(
+      (gemini.runtimeOptions[0]!.agentRegistry as { resolve(name: string): string }).resolve(
+        "gemini",
+      ),
+    ).toBe("gemini --acp -m 'gemini-2.5-pro'");
   });
 
   it("does not inject CODEX_CONFIG or session config when Codex overrides are absent", async () => {
