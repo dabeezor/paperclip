@@ -9740,9 +9740,6 @@ export function issueRoutes(
           eq(agents.companyId, existing.companyId),
         )).limit(1).then((rows) => rows[0] ?? null);
         if (!target) throw unprocessable("Unblock owner agent must belong to the issue company");
-        if (req.actor.type === "agent" && req.actor.agentId !== owner.agentId) {
-          throw forbidden("Agents may only name themselves as an unblock owner");
-        }
       } else if (owner !== "board" && "userId" in owner) {
         const member = await db.select({ id: companyMemberships.id }).from(companyMemberships).where(and(
           eq(companyMemberships.companyId, existing.companyId),
