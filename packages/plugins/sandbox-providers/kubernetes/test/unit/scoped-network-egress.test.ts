@@ -12,10 +12,12 @@ describe("scoped network egress", () => {
       networkEgress: {
         allowFqdns: ["GitHub.com", "pypi.org"],
         allowCidrs: ["203.0.113.0/24"],
+        allowTcpCidrs: [{ cidr: "10.10.10.140/32", port: 3389 }],
       },
     })).toEqual({
       allowFqdns: ["github.com", "pypi.org"],
       allowCidrs: ["203.0.113.0/24"],
+      allowTcpCidrs: [{ cidr: "10.10.10.140/32", port: 3389 }],
     });
   });
 
@@ -28,7 +30,7 @@ describe("scoped network egress", () => {
       runId: "run-123",
       workloadName: "pc-workload",
       ownerReference: { apiVersion: "batch/v1", kind: "Job", name: "pc-workload", uid: "uid-1" },
-      grant: { allowFqdns: ["github.com", "pypi.org"], allowCidrs: [] },
+      grant: { allowFqdns: ["github.com", "pypi.org"], allowCidrs: [], allowTcpCidrs: [] },
     });
     expect(createNamespacedNetworkPolicy).toHaveBeenCalledWith(expect.objectContaining({
       namespace: "paperclip-acme",
@@ -50,7 +52,7 @@ describe("scoped network egress", () => {
       runId: "run-123",
       workloadName,
       ownerReference: { apiVersion: "batch/v1", kind: "Job", name: workloadName, uid: "uid-1" },
-      grant: { allowFqdns: ["github.com"], allowCidrs: [] },
+      grant: { allowFqdns: ["github.com"], allowCidrs: [], allowTcpCidrs: [] },
     });
 
     expect(name).toHaveLength(253);
@@ -61,6 +63,7 @@ describe("scoped network egress", () => {
     expect(appendNetworkEgressDenyHint("curl: Could not resolve host: example.com", {
       allowFqdns: ["github.com"],
       allowCidrs: [],
+      allowTcpCidrs: [],
     })).toContain("executionWorkspaceSettings.networkEgress");
   });
 
@@ -79,7 +82,7 @@ describe("scoped network egress", () => {
       runId: "run-123",
       workloadName: "pc-workload",
       ownerReference: { apiVersion: "batch/v1", kind: "Job", name: "pc-workload", uid: "uid-1" },
-      grant: { allowFqdns: ["github.com"], allowCidrs: [] },
+      grant: { allowFqdns: ["github.com"], allowCidrs: [], allowTcpCidrs: [] },
     }, releaseWorkload)).rejects.toBe(policyError);
     expect(releaseWorkload).toHaveBeenCalledOnce();
   });

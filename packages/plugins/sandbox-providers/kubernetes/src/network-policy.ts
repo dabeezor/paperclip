@@ -2,6 +2,7 @@ export interface BuildNetworkPolicyInput {
   namespace: string;
   paperclipServerNamespace: string;
   egressAllowCidrs: string[];
+  egressAllowTcpCidrs?: Array<{ cidr: string; port: number }>;
   /**
    * Adapter-configured FQDNs (e.g. `api.anthropic.com`). Standard
    * NetworkPolicy cannot express FQDNs natively — only Cilium can.
@@ -100,6 +101,10 @@ export function buildNetworkPolicyManifests(input: BuildNetworkPolicyInput): Rec
         ...input.egressAllowCidrs.map((cidr) => ({
           to: [{ ipBlock: { cidr } }],
         })),
+        ...((input.egressAllowTcpCidrs ?? []).map(({ cidr, port }) => ({
+          to: [{ ipBlock: { cidr } }],
+          ports: [{ protocol: "TCP", port }],
+        }))),
         // Standard-NetworkPolicy fallback for FQDN-based egress. If the
         // adapter requires FQDNs (e.g. api.anthropic.com) and the
         // operator didn't supply explicit CIDRs, allow public IPv4 with

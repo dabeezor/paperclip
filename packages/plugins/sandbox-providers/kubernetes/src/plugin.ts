@@ -426,6 +426,8 @@ const plugin = definePlugin({
     adapterEnv.PAPERCLIP_NETWORK_EGRESS_GRANT_PATH = NETWORK_EGRESS_GRANT_PATH;
     adapterEnv.PAPERCLIP_NETWORK_EGRESS_ALLOW_FQDNS = scopedNetworkEgress.allowFqdns.join(",");
     adapterEnv.PAPERCLIP_NETWORK_EGRESS_ALLOW_CIDRS = scopedNetworkEgress.allowCidrs.join(",");
+    adapterEnv.PAPERCLIP_NETWORK_EGRESS_ALLOW_TCP_CIDRS = scopedNetworkEgress.allowTcpCidrs
+      .map(({ cidr, port }) => `${cidr}:tcp/${port}`).join(",");
     const bootstrapToken = generateBootstrapToken();
 
     // Secret ownerRef: for job backend, the Job owns the Secret (cascade delete).

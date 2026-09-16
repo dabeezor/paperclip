@@ -7,23 +7,33 @@ export const NETWORK_EGRESS_GRANT_PATH = "executionWorkspaceSettings.networkEgre
 export interface ScopedNetworkEgressGrant {
   allowFqdns: string[];
   allowCidrs: string[];
+  allowTcpCidrs: Array<{ cidr: string; port: number }>;
 }
 
 export function parseScopedNetworkEgressGrant(settings: unknown): ScopedNetworkEgressGrant {
   if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
-    return { allowFqdns: [], allowCidrs: [] };
+    return { allowFqdns: [], allowCidrs: [], allowTcpCidrs: [] };
   }
   const networkEgress = (settings as Record<string, unknown>).networkEgress;
   if (!networkEgress || typeof networkEgress !== "object" || Array.isArray(networkEgress)) {
-    return { allowFqdns: [], allowCidrs: [] };
+    return { allowFqdns: [], allowCidrs: [], allowTcpCidrs: [] };
   }
   const record = networkEgress as Record<string, unknown>;
   const strings = (value: unknown) => Array.isArray(value)
     ? [...new Set(value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean))]
     : [];
+  const tcpCidrs = Array.isArray(record.allowTcpCidrs)
+    ? record.allowTcpCidrs.flatMap((value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+      const item = value as Record<string, unknown>;
+      if (typeof item.cidr !== "string" || !Number.isInteger(item.port) || item.port < 1 || item.port > 65535) return [];
+      return [{ cidr: item.cidr.trim(), port: item.port }];
+    })
+    : [];
   return {
     allowFqdns: strings(record.allowFqdns).map((fqdn) => fqdn.toLowerCase()),
     allowCidrs: strings(record.allowCidrs),
+    allowTcpCidrs: [...new Map(tcpCidrs.map((item) => [`${item.cidr}:${item.port}`, item])).values()],
   };
 }
 
@@ -36,7 +46,7 @@ export async function createScopedNetworkEgressPolicy(input: {
   ownerReference: Record<string, unknown>;
   grant: ScopedNetworkEgressGrant;
 }): Promise<string | null> {
-  if (input.grant.allowFqdns.length === 0 && input.grant.allowCidrs.length === 0) return null;
+  if (input.grant.allowFqdns.length === 0 && input.grant.allowCidrs.length === 0 && input.grant.allowTcpCidrs.length === 0) return null;
   const suffix = "-egress";
   const maxWorkloadLength = 253 - suffix.length;
   const workloadName = input.workloadName.length <= maxWorkloadLength
@@ -49,6 +59,7 @@ export async function createScopedNetworkEgressPolicy(input: {
       paperclipServerNamespace: "",
       egressAllowFqdns: input.grant.allowFqdns,
       egressAllowCidrs: input.grant.allowCidrs,
+      egressAllowTcpCidrs: input.grant.allowTcpCidrs,
       name,
       endpointSelector: { "paperclip.io/run-id": input.runId },
       includeBaseRules: false,
@@ -67,6 +78,7 @@ export async function createScopedNetworkEgressPolicy(input: {
       paperclipServerNamespace: "",
       egressAllowFqdns: input.grant.allowFqdns,
       egressAllowCidrs: input.grant.allowCidrs,
+      egressAllowTcpCidrs: input.grant.allowTcpCidrs,
       name,
       podSelector: { "paperclip.io/run-id": input.runId },
       includeBaseRules: false,
@@ -100,7 +112,7 @@ export function appendNetworkEgressDenyHint(stderr: string, grant: ScopedNetwork
   if (!/(could not resolve host|network is unreachable|connection timed out|failed to connect|temporary failure in name resolution)/i.test(stderr)) {
     return stderr;
   }
-  const allowed = [...grant.allowFqdns, ...grant.allowCidrs];
+  const allowed = [...grant.allowFqdns, ...grant.allowCidrs, ...grant.allowTcpCidrs.map(({ cidr, port }) => `${cidr}:tcp/${port}`)];
   const detail = allowed.length > 0 ? ` Current task grant: ${allowed.join(", ")}.` : " No task-scoped destinations are granted.";
   return `${stderr.trimEnd()}\nPaperclip network policy denied or could not route this request.${detail} Request access through ${NETWORK_EGRESS_GRANT_PATH}.\n`;
 }
